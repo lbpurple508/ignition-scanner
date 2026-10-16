@@ -1,6 +1,8 @@
 import os
+import json
 import time
 import html
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -28,6 +30,8 @@ BTC_24H_KILL  = -2.0
 TP_PCT        = 3.0
 SL_PCT        = -3.0
 MAX_WORKERS   = 16
+SEEN_FILE     = Path("seen_signals.json")
+SEEN_TTL_SEC  = 24 * 3600
 # =========================
 
 STABLE = {"XUSD","USDE","RLUSD","U","USDC","USDT","DAI","TUSD",
@@ -72,6 +76,25 @@ def fmt_price(p):
     if p >= 0.01:   return f"${p:.5f}"
     if p >= 0.0001: return f"${p:.6f}"
     return f"${p:.8f}".rstrip("0").rstrip(".")
+
+
+def load_seen():
+    if not SEEN_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SEEN_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def save_seen(seen):
+    try:
+        SEEN_FILE.write_text(json.dumps(seen))
+    except Exception as exc:
+        print(f"save_seen error: {exc}")
 
 
 def fetch_universe():
@@ -215,9 +238,11 @@ def main():
     print("SCANNER STARTING — IST", ist_now().strftime("%Y-%m-%d %H:%M"))
     print("=" * 60)
 
+    # BTC regime
     btc = btc_regime()
     if btc is None:
-        print("BTC fetch failed — abort")
+        print("BTC fetch failed — alerting and abort")
+        telegram("⚠️ <b>Scanner:</b> BTC fetch failed. No signals this run.")
         return
     print(f"BTC 1h {btc['1h']:+.2f}%  4h {btc['4h']:+.2f}%  24h {btc['24h']:+.2f}%")
 
@@ -228,13 +253,16 @@ def main():
         print(f"BTC 4h {btc['4h']:+.2f}% < {BTC_4H_MIN}% — no signals")
         return
 
+    # Universe
     try:
         syms = fetch_universe()
     except Exception as exc:
         print(f"Universe error: {exc}")
+        telegram(f"⚠️ <b>Scanner:</b> universe fetch failed: {html.escape(str(exc))[:200]}")
         return
     print(f"Universe: {len(syms)} pairs < ${PRICE_CAP}")
 
+    # Scan
     hits = []
     def worker(sym):
         d = fetch_klines(sym)
@@ -251,13 +279,29 @@ def main():
 
     print(f"Signals found: {len(hits)}")
 
-    hits.sort(key=lambda x: x[1]["vol_x"], reverse=True)
-    for sym, sig in hits:
-        msg = format_alert(sym, sig, btc)
-        ok = telegram(msg)
-        print(f"  {sym}: {'sent' if ok else 'FAILED'}  "
-              f"break {sig['break_pct']:+.2f}%  vol {sig['vol_x']:.1f}x")
+    # Dedup
+    seen = load_seen()
+    cutoff = time.time() - SEEN_TTL_SEC
+    seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and v > cutoff}
 
+    # Alert
+    hits.sort(key=lambda x: x[1]["vol_x"], reverse=True)
+    sent_count = 0
+    for sym, sig in hits:
+        key = f"{sym}|{int(sig['entry'] * 1e8)}"
+        if key in seen:
+            print(f"  {sym}: already sent — skip")
+            continue
+        msg = format_alert(sym, sig, btc)
+        if telegram(msg):
+            seen[key] = time.time()
+            sent_count += 1
+            print(f"  {sym}: sent  break {sig['break_pct']:+.2f}%  vol {sig['vol_x']:.1f}x")
+        else:
+            print(f"  {sym}: FAILED")
+
+    save_seen(seen)
+    print(f"Sent: {sent_count}")
     print("Done.")
 
 
