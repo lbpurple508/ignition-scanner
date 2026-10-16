@@ -130,7 +130,6 @@ def btc_regime():
     if not k or len(k) < 98:
         return None
     try:
-        # strip the currently-forming candle
         if int(k[-1][6]) >= time.time() * 1000:
             k = k[:-1]
         if len(k) < 97:
@@ -151,16 +150,18 @@ def fetch_klines(sym):
     if not k or len(k) < 100:
         return None
     try:
+        if int(k[-1][6]) >= time.time() * 1000:
+            k = k[:-1]
+        if len(k) < 100:
+            return None
         o  = np.array([float(x[1]) for x in k], dtype=float)
         h  = np.array([float(x[2]) for x in k], dtype=float)
         l  = np.array([float(x[3]) for x in k], dtype=float)
         c  = np.array([float(x[4]) for x in k], dtype=float)
         v  = np.array([float(x[5]) for x in k], dtype=float)
         tb = np.array([float(x[9]) for x in k], dtype=float)
-        if int(k[-1][6]) >= time.time() * 1000:
-            o = o[:-1]; h = h[:-1]; l = l[:-1]
-            c = c[:-1]; v = v[:-1]; tb = tb[:-1]
-        return {"o": o, "h": h, "l": l, "c": c, "v": v, "tb": tb}
+        return {"o": o, "h": h, "l": l, "c": c, "v": v, "tb": tb,
+                "open_ms": int(k[-1][0])}
     except (ValueError, IndexError):
         return None
 
@@ -245,7 +246,6 @@ def main():
     print("SCANNER STARTING — IST", ist_now().strftime("%Y-%m-%d %H:%M"))
     print("=" * 60)
 
-    # BTC regime
     btc = btc_regime()
     if btc is None:
         print("BTC fetch failed — alerting and abort")
@@ -260,7 +260,6 @@ def main():
         print(f"BTC 4h {btc['4h']:+.2f}% < {BTC_4H_MIN}% — no signals")
         return
 
-    # Universe
     try:
         syms = fetch_universe()
     except Exception as exc:
@@ -269,41 +268,49 @@ def main():
         return
     print(f"Universe: {len(syms)} pairs < ${PRICE_CAP}")
 
-    # Scan
     hits = []
     failed = 0
+
     def worker(sym):
-        d = fetch_klines(sym)
-        if d is None:
+        try:
+            d = fetch_klines(sym)
+            if d is None:
+                return ("FAIL", sym)
+            sig = check_signal(d)
+            if sig is None:
+                return None
+            return ("HIT", sym, sig, d["open_ms"])
+        except Exception as exc:
+            print(f"  worker error {sym}: {exc}")
             return ("FAIL", sym)
-        sig = check_signal(d)
-        if sig is None:
-            return None
-        return ("HIT", sym, sig)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = [pool.submit(worker, s) for s in syms]
         for f in as_completed(futs):
-            r = f.result()
-            if r is None: continue
+            try:
+                r = f.result()
+            except Exception as exc:
+                failed += 1
+                print(f"  future error: {exc}")
+                continue
+            if r is None:
+                continue
             if r[0] == "FAIL":
                 failed += 1
             elif r[0] == "HIT":
-                hits.append((r[1], r[2]))
+                hits.append((r[1], r[2], r[3]))
 
     print(f"Checked: {len(syms) - failed}/{len(syms)}  (failed: {failed})")
     print(f"Signals found: {len(hits)}")
 
-    # Dedup
     seen = load_seen()
     cutoff = time.time() - SEEN_TTL_SEC
     seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and v > cutoff}
 
-    # Alert
     hits.sort(key=lambda x: x[1]["vol_x"], reverse=True)
     sent_count = 0
-    for sym, sig in hits:
-        key = f"{sym}|{int(sig['entry'] * 1e8)}"
+    for sym, sig, open_ms in hits:
+        key = f"{sym}|{open_ms}"
         if key in seen:
             print(f"  {sym}: already sent — skip")
             continue
