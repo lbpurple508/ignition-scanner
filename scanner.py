@@ -75,7 +75,8 @@ def fmt_price(p):
     if p >= 1:      return f"${p:.4f}"
     if p >= 0.01:   return f"${p:.5f}"
     if p >= 0.0001: return f"${p:.6f}"
-    return f"${p:.8f}".rstrip("0").rstrip(".")
+    if p >= 0.00000001: return f"${p:.10f}".rstrip("0").rstrip(".")
+    return f"${p:.2e}"
 
 
 def load_seen():
@@ -123,11 +124,17 @@ def fetch_universe():
 
 
 def btc_regime():
+    """BTC 1h/4h/24h % change using ONLY completed 15m candles."""
     k = get(f"{BINANCE}/api/v3/klines",
             {"symbol": "BTCUSDT", "interval": "15m", "limit": 100})
-    if not k or len(k) < 97:
+    if not k or len(k) < 98:
         return None
     try:
+        # strip the currently-forming candle
+        if int(k[-1][6]) >= time.time() * 1000:
+            k = k[:-1]
+        if len(k) < 97:
+            return None
         c = [float(x[4]) for x in k]
         return {
             "1h":  (c[-1] / c[-5]  - 1) * 100,
@@ -264,19 +271,27 @@ def main():
 
     # Scan
     hits = []
+    failed = 0
     def worker(sym):
         d = fetch_klines(sym)
-        if d is None: return None
+        if d is None:
+            return ("FAIL", sym)
         sig = check_signal(d)
-        if sig is None: return None
-        return (sym, sig)
+        if sig is None:
+            return None
+        return ("HIT", sym, sig)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = [pool.submit(worker, s) for s in syms]
         for f in as_completed(futs):
             r = f.result()
-            if r: hits.append(r)
+            if r is None: continue
+            if r[0] == "FAIL":
+                failed += 1
+            elif r[0] == "HIT":
+                hits.append((r[1], r[2]))
 
+    print(f"Checked: {len(syms) - failed}/{len(syms)}  (failed: {failed})")
     print(f"Signals found: {len(hits)}")
 
     # Dedup
