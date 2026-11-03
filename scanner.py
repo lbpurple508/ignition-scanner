@@ -27,7 +27,7 @@ BINANCE = "https://data-api.binance.vision"
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
 MAX_WORKERS = 12
-REQUESTS_PER_SECOND = 8  # 8 kline requests/s ~= 960 request-weight/minute.
+REQUESTS_PER_SECOND = 8  # Binance kline request weight is 2: about 960 weight/minute.
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / ".scanner_state"
 STATE_FILE = STATE_DIR / "seen_signals.json"
@@ -51,7 +51,7 @@ STOCK_LINKED_ASSETS = frozenset({
     "SPYB", "SQQQB", "STXB", "TSLAB", "TMFB", "TSMB", "USARB", "USDEB",
     "UVXYB", "VSTB", "WDCB", "WENB", "ZMB", "SKDDB", "SKUUB",
 })
-TT_LOOKBACK_KLINES = 10
+PENDING_TTL_MS = 30 * 60 * 1000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ignition-scanner")
@@ -187,14 +187,14 @@ def exact_t_candle(kline):
     }
 
 
-def fetch_recent_closed_klines(symbol, server_time_ms):
-    """Fetch a short history of fully closed 15-minute candles for TT detection."""
+def fetch_latest_two_closed_klines(symbol, server_time_ms):
+    """Fetch only the latest two fully closed, consecutive 15-minute candles."""
     klines = get_json(
         "/api/v3/klines",
-        {"symbol": symbol, "interval": INTERVAL, "limit": TT_LOOKBACK_KLINES},
+        {"symbol": symbol, "interval": INTERVAL, "limit": 3},
     )
     if not isinstance(klines, list):
-        return []
+        return None
 
     closed = []
     for kline in klines:
@@ -204,14 +204,20 @@ def fetch_recent_closed_klines(symbol, server_time_ms):
         except (IndexError, TypeError, ValueError):
             continue
 
-        # Binance 15m klines close at open time + interval - 1 ms.
+        # A Binance 15m candle closes at open + 15m - 1ms.
         if close_time_ms >= server_time_ms:
             continue
         if close_time_ms != open_time_ms + INTERVAL_MS - 1:
             continue
         closed.append(kline)
 
-    return closed
+    if len(closed) < 2:
+        return None
+
+    first, second = closed[-2], closed[-1]
+    if int(second[0]) - int(first[0]) != INTERVAL_MS:
+        return None
+    return first, second
 
 
 def fmt_price(value):
@@ -306,8 +312,11 @@ def load_state():
 
     if not isinstance(data, dict):
         return {"seen": {}, "pending": {}}
-    if isinstance(data.get("seen"), dict) and isinstance(data.get("pending"), dict):
-        return {"seen": data["seen"], "pending": data["pending"]}
+    if "seen" in data or "pending" in data:
+        return {
+            "seen": data.get("seen") if isinstance(data.get("seen"), dict) else {},
+            "pending": data.get("pending") if isinstance(data.get("pending"), dict) else {},
+        }
     # Backward compatibility with the original {"SYMBOL|open_time": timestamp} file.
     return {"seen": data, "pending": {}}
 
@@ -340,6 +349,26 @@ def serialize_match(symbol, first, second):
     }
 
 
+def prune_pending_alerts(pending, server_time_ms):
+    """Discard malformed, stock-linked, or stale queued alerts (keep 30 minutes max)."""
+    cutoff_ms = server_time_ms - PENDING_TTL_MS
+    kept = {}
+    for key, record in pending.items():
+        symbol = key.split("|", 1)[0] if isinstance(key, str) else ""
+        if is_stock_linked_symbol(symbol) or not isinstance(record, dict):
+            continue
+        second = record.get("second")
+        if not isinstance(second, dict):
+            continue
+        try:
+            close_time_ms = int(second["close_time_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cutoff_ms <= close_time_ms < server_time_ms:
+            kept[key] = record
+    return kept
+
+
 def _deserialize_t_candle(record):
     if not isinstance(record, dict):
         raise ValueError("Invalid T-candle data")
@@ -370,21 +399,20 @@ def deserialize_pending(record):
 
 
 def scan_symbol(symbol, server_time_ms):
+    """Return at most one signal: only the latest two closed candles may form TT."""
     try:
-        klines = fetch_recent_closed_klines(symbol, server_time_ms)
-        matches = []
-        for first_raw, second_raw in zip(klines, klines[1:]):
-            # Only consecutive 15-minute candles can form a TT pair.
-            if int(second_raw[0]) - int(first_raw[0]) != INTERVAL_MS:
-                continue
-            first = exact_t_candle(first_raw)
-            if first is None:
-                continue
-            second = exact_t_candle(second_raw)
-            if second is None:
-                continue
-            matches.append((symbol, first, second))
-        return matches
+        klines = fetch_latest_two_closed_klines(symbol, server_time_ms)
+        if klines is None:
+            return None
+        first = exact_t_candle(klines[0])
+        if first is None:
+            return None
+        second = exact_t_candle(klines[1])
+        if second is None:
+            return None
+        if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
+            return None
+        return symbol, first, second
     except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
         log.warning("Could not scan %s: %s", symbol, exc)
         return "__SCAN_ERROR__", symbol
@@ -417,7 +445,7 @@ def run_scan():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
 
-    log.info("Scanner started in TT mode: two consecutive exact T candles; stocks excluded")
+    log.info("Scanner started in strict TT mode: latest two closed candles only; stocks excluded")
     server_time_ms = fetch_server_time_ms()
     symbols = fetch_universe()
     log.info("Binance Spot USDT pairs: %s", len(symbols))
@@ -438,20 +466,17 @@ def run_scan():
             if isinstance(result, tuple) and len(result) == 2 and result[0] == "__SCAN_ERROR__":
                 scan_errors += 1
             else:
-                hits.extend(result)
+                hits.append(result)
 
-    log.info("Scan complete: %s eligible crypto pairs checked; %s errors; %s TT matches", len(symbols), scan_errors, len(hits))
+    log.info("Scan complete: %s eligible crypto pairs checked; %s errors; %s latest-pair TT matches", len(symbols), scan_errors, len(hits))
 
     state = load_state()
     now = time.time()
     cutoff = now - SEEN_TTL_SEC
     old_seen = state["seen"]
     old_pending = state["pending"]
-    # Drop tokenized stock/security alerts already queued by an older scanner version.
-    state["pending"] = {
-        key: record for key, record in old_pending.items()
-        if not is_stock_linked_symbol(key.split("|", 1)[0])
-    }
+    # Purge legacy stock alerts and old TT alerts queued by earlier lookback logic.
+    state["pending"] = prune_pending_alerts(old_pending, server_time_ms)
     state["seen"] = {
         key: timestamp
         for key, timestamp in old_seen.items()
