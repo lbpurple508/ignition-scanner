@@ -154,23 +154,34 @@ def exact_t_candle(kline):
     }
 
 
-def fetch_latest_closed_kline(symbol, server_time_ms):
-    """Fetch the latest fully closed 15-minute candle for one pair."""
+def fetch_latest_two_closed_klines(symbol, server_time_ms):
+    """Fetch the latest two consecutive, fully closed 15-minute candles."""
     klines = get_json(
         "/api/v3/klines",
-        {"symbol": symbol, "interval": INTERVAL, "limit": 2},
+        {"symbol": symbol, "interval": INTERVAL, "limit": 3},
     )
     if not isinstance(klines, list):
         return None
 
-    for kline in reversed(klines):
+    closed = []
+    for kline in klines:
         try:
             close_time_ms = int(kline[6])
         except (IndexError, TypeError, ValueError):
             continue
         if close_time_ms < server_time_ms:
-            return kline
-    return None
+            closed.append(kline)
+
+    if len(closed) < 2:
+        return None
+
+    # Require two adjacent 15-minute intervals; do not join candles across a gap.
+    first_open_ms = int(closed[-2][0])
+    second_open_ms = int(closed[-1][0])
+    if second_open_ms - first_open_ms != INTERVAL_MS:
+        return None
+
+    return closed[-2], closed[-1]
 
 
 def fmt_price(value):
@@ -180,21 +191,22 @@ def fmt_price(value):
     return text or "0"
 
 
-def format_alert(symbol, candle):
-    close_time = datetime.fromtimestamp(
-        candle["close_time_ms"] / 1000, tz=timezone.utc
+def format_alert(symbol, first, second):
+    first_time = datetime.fromtimestamp(
+        first["close_time_ms"] / 1000, tz=timezone.utc
+    ).astimezone(IST)
+    second_time = datetime.fromtimestamp(
+        second["close_time_ms"] / 1000, tz=timezone.utc
     ).astimezone(IST)
     return (
-        "🟢 <b>15m T-CANDLE MATCH</b>\n\n"
+        "🟢 <b>15m TT-CANDLE MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
-        "<b>Body:</b> 0%\n"
-        "<b>Upper Wick:</b> 0%\n"
-        "<b>Lower Wick:</b> 100%\n\n"
-        f"<b>Open:</b> {fmt_price(candle['open'])}\n"
-        f"<b>High:</b> {fmt_price(candle['high'])}\n"
-        f"<b>Low:</b> {fmt_price(candle['low'])}\n"
-        f"<b>Close:</b> {fmt_price(candle['close'])}\n"
-        f"<b>Candle closed:</b> {close_time:%Y-%m-%d %H:%M:%S} IST"
+        "<b>Two consecutive T candles detected</b>\n"
+        "<b>Each candle:</b> Body 0% | Upper Wick 0% | Lower Wick 100%\n\n"
+        f"<b>T1:</b> O/H/C {fmt_price(first['open'])} | L {fmt_price(first['low'])}\n"
+        f"<b>T1 closed:</b> {first_time:%Y-%m-%d %H:%M:%S} IST\n"
+        f"<b>T2:</b> O/H/C {fmt_price(second['open'])} | L {fmt_price(second['low'])}\n"
+        f"<b>T2 closed:</b> {second_time:%Y-%m-%d %H:%M:%S} IST"
     )
 
 
@@ -279,9 +291,8 @@ def save_state(state):
     temporary_file.replace(STATE_FILE)
 
 
-def serialize_candle(symbol, candle):
+def _serialize_t_candle(candle):
     return {
-        "symbol": symbol,
         "open": str(candle["open"]),
         "high": str(candle["high"]),
         "low": str(candle["low"]),
@@ -291,9 +302,17 @@ def serialize_candle(symbol, candle):
     }
 
 
-def deserialize_pending(record):
-    if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
-        raise ValueError("Invalid pending alert")
+def serialize_match(symbol, first, second):
+    return {
+        "symbol": symbol,
+        "first": _serialize_t_candle(first),
+        "second": _serialize_t_candle(second),
+    }
+
+
+def _deserialize_t_candle(record):
+    if not isinstance(record, dict):
+        raise ValueError("Invalid T-candle data")
     candle = {
         "open": Decimal(str(record["open"])),
         "high": Decimal(str(record["high"])),
@@ -306,19 +325,32 @@ def deserialize_pending(record):
         "lower_wick_pct": Decimal("100"),
     }
     if not (candle["open"] == candle["high"] == candle["close"] and candle["low"] < candle["high"]):
-        raise ValueError("Pending alert no longer satisfies the exact T-candle rule")
-    return record["symbol"], candle
+        raise ValueError("Pending candle does not satisfy the exact T-candle rule")
+    return candle
+
+
+def deserialize_pending(record):
+    if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
+        raise ValueError("Invalid pending TT alert")
+    first = _deserialize_t_candle(record["first"])
+    second = _deserialize_t_candle(record["second"])
+    if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
+        raise ValueError("Pending T candles are not consecutive 15-minute candles")
+    return record["symbol"], first, second
 
 
 def scan_symbol(symbol, server_time_ms):
     try:
-        kline = fetch_latest_closed_kline(symbol, server_time_ms)
-        if kline is None:
+        klines = fetch_latest_two_closed_klines(symbol, server_time_ms)
+        if klines is None:
             return None
-        candle = exact_t_candle(kline)
-        if candle is None:
+        first = exact_t_candle(klines[0])
+        second = exact_t_candle(klines[1])
+        if first is None or second is None:
             return None
-        return symbol, candle
+        if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
+            return None
+        return symbol, first, second
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
         log.warning("Could not scan %s: %s", symbol, exc)
         return "__SCAN_ERROR__", symbol
@@ -388,10 +420,10 @@ def run_scan():
     }
     state_changed = state["seen"] != old_seen
 
-    for symbol, candle in hits:
-        key = f"{symbol}|{candle['open_time_ms']}"
+    for symbol, first, second in hits:
+        key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
         if key not in state["seen"] and key not in state["pending"]:
-            state["pending"][key] = serialize_candle(symbol, candle)
+            state["pending"][key] = serialize_match(symbol, first, second)
             state_changed = True
 
     # Persist matches before sending, so a temporary Telegram failure is retried next cron run.
@@ -406,14 +438,14 @@ def run_scan():
             state_changed = True
             continue
         try:
-            symbol, candle = deserialize_pending(state["pending"][key])
+            symbol, first, second = deserialize_pending(state["pending"][key])
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             log.error("Removing invalid pending alert %s: %s", key, exc)
             del state["pending"][key]
             state_changed = True
             continue
 
-        if telegram(format_alert(symbol, candle)):
+        if telegram(format_alert(symbol, first, second)):
             state["seen"][key] = time.time()
             del state["pending"][key]
             sent_count += 1
