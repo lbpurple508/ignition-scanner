@@ -1,330 +1,326 @@
-import os
-import json
-import time
 import html
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
+import json
+import logging
+import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 BINANCE = "https://data-api.binance.vision"
+INTERVAL = "15m"
+INTERVAL_MS = 15 * 60 * 1000
+MAX_WORKERS = 12
+SEEN_FILE = Path(".scanner_state/seen_signals.json")
+SEEN_TTL_SEC = 24 * 60 * 60
+IST = ZoneInfo("Asia/Kolkata")
 
-# ===== SYSTEM RULES =====
-PRICE_CAP     = 2.0
-BARS          = 400
-BODY_MIN      = 70.0
-VOL_X_MIN     = 2.5
-TAKER_MIN     = 0.55
-BREAK_MAX_PCT = 2.5
-RET_4H_MAX    = 4.0
-RNG_12H_MIN   = 3.0
-
-BTC_4H_MIN    = 0.3
-BTC_24H_KILL  = -2.0
-
-TP_PCT        = 3.0
-SL_PCT        = -3.0
-MAX_WORKERS   = 16
-SEEN_FILE     = Path("seen_signals.json")
-SEEN_TTL_SEC  = 24 * 3600
-# =========================
-
-STABLE = {"XUSD","USDE","RLUSD","U","USDC","USDT","DAI","TUSD",
-          "FDUSD","BUSD","PYUSD","USDP","EUR","USD1","AEUR","EURI"}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("ignition-scanner")
+_thread_local = threading.local()
 
 
-def ist_now():
-    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+def _session():
+    """Give each worker its own HTTP session with bounded retries."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        retry = Retry(
+            total=4,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=MAX_WORKERS,
+            pool_maxsize=MAX_WORKERS,
+        )
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": "ignition-scanner/2.0"})
+        _thread_local.session = session
+    return session
 
 
-def get(url, params=None, retries=3):
-    for _ in range(retries):
+def get_json(path, params=None):
+    response = _session().get(f"{BINANCE}{path}", params=params, timeout=(5, 20))
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_server_time_ms():
+    payload = get_json("/api/v3/time")
+    server_time = int(payload["serverTime"])
+    if server_time <= 0:
+        raise RuntimeError("Binance returned an invalid server time")
+    return server_time
+
+
+def fetch_universe():
+    """Return every active Binance Spot symbol quoted in USDT; apply no market filters."""
+    exchange_info = get_json("/api/v3/exchangeInfo")
+    entries = exchange_info.get("symbols") if isinstance(exchange_info, dict) else None
+    if not isinstance(entries, list):
+        raise RuntimeError("Binance returned an invalid exchange-info response")
+
+    symbols = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        if item.get("quoteAsset") != "USDT":
+            continue
+        if item.get("status") != "TRADING":
+            continue
+        if item.get("isSpotTradingAllowed") is False:
+            continue
+        symbol = item.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            symbols.append(symbol)
+
+    if not symbols:
+        raise RuntimeError("Binance returned no active USDT Spot pairs")
+    return sorted(set(symbols))
+
+
+def exact_t_candle(kline):
+    """Match ONLY Body 0%, Upper Wick 0%, Lower Wick 100%.
+
+    This is exactly equivalent to Open == High == Close and Low < High.
+    Decimal is used so equality is exact rather than floating-point approximate.
+    """
+    try:
+        open_price = Decimal(str(kline[1]))
+        high_price = Decimal(str(kline[2]))
+        low_price = Decimal(str(kline[3]))
+        close_price = Decimal(str(kline[4]))
+        open_time_ms = int(kline[0])
+        close_time_ms = int(kline[6])
+    except (IndexError, TypeError, ValueError, InvalidOperation):
+        return None
+
+    prices = (open_price, high_price, low_price, close_price)
+    if not all(price.is_finite() for price in prices):
+        return None
+    if not (open_price == high_price == close_price and low_price < high_price):
+        return None
+
+    return {
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "open_time_ms": open_time_ms,
+        "close_time_ms": close_time_ms,
+        "body_pct": Decimal("0"),
+        "upper_wick_pct": Decimal("0"),
+        "lower_wick_pct": Decimal("100"),
+    }
+
+
+def fetch_latest_closed_kline(symbol, server_time_ms):
+    """Fetch the latest fully closed 15-minute candle for one pair."""
+    klines = get_json(
+        "/api/v3/klines",
+        {"symbol": symbol, "interval": INTERVAL, "limit": 2},
+    )
+    if not isinstance(klines, list):
+        return None
+
+    for kline in reversed(klines):
         try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-        except requests.RequestException:
-            time.sleep(1)
+            close_time_ms = int(kline[6])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if close_time_ms < server_time_ms:
+            return kline
     return None
 
 
-def telegram(msg):
+def fmt_price(value):
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def format_alert(symbol, candle):
+    close_time = datetime.fromtimestamp(
+        candle["close_time_ms"] / 1000, tz=timezone.utc
+    ).astimezone(IST)
+    return (
+        "🟢 <b>15m T-CANDLE MATCH</b>\n\n"
+        f"<b>Pair:</b> {html.escape(symbol)}\n"
+        "<b>Body:</b> 0%\n"
+        "<b>Upper Wick:</b> 0%\n"
+        "<b>Lower Wick:</b> 100%\n\n"
+        f"<b>Open:</b> {fmt_price(candle['open'])}\n"
+        f"<b>High:</b> {fmt_price(candle['high'])}\n"
+        f"<b>Low:</b> {fmt_price(candle['low'])}\n"
+        f"<b>Close:</b> {fmt_price(candle['close'])}\n"
+        f"<b>Candle closed:</b> {close_time:%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram env missing")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15,
-        )
-        return r.status_code == 200 and r.json().get("ok", False)
-    except Exception as exc:
-        print(f"Telegram error: {exc}")
+        log.error("Telegram is not configured: set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID secrets")
         return False
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
 
-def fmt_price(p):
-    p = float(p)
-    if p >= 1:      return f"${p:.4f}"
-    if p >= 0.01:   return f"${p:.5f}"
-    if p >= 0.0001: return f"${p:.6f}"
-    if p >= 0.00000001: return f"${p:.10f}".rstrip("0").rstrip(".")
-    return f"${p:.2e}"
+    for attempt in range(3):
+        try:
+            response = _session().post(url, json=payload, timeout=(5, 20))
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+
+            if response.status_code == 429:
+                parameters = result.get("parameters") or {}
+                retry_after = parameters.get("retry_after", 2)
+                try:
+                    delay = int(retry_after)
+                except (TypeError, ValueError):
+                    delay = 2
+                time.sleep(min(max(delay, 1), 30))
+                continue
+
+            return response.status_code == 200 and result.get("ok") is True
+        except requests.RequestException as exc:
+            # Do not log the exception string: request URLs contain the Telegram bot token.
+            log.warning("Telegram request failed (attempt %s/3): %s", attempt + 1, type(exc).__name__)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    return False
 
 
 def load_seen():
-    if not SEEN_FILE.exists():
-        return {}
     try:
-        data = json.loads(SEEN_FILE.read_text())
-        if not isinstance(data, dict):
-            return {}
-        return data
-    except Exception:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not read scanner state; starting with an empty state: %s", exc)
         return {}
 
 
 def save_seen(seen):
+    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file = SEEN_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(seen, separators=(",", ":")), encoding="utf-8")
+    temporary_file.replace(SEEN_FILE)
+
+
+def set_github_output(name, value):
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"{name}={value}\n")
+
+
+def scan_symbol(symbol, server_time_ms):
     try:
-        SEEN_FILE.write_text(json.dumps(seen))
-    except Exception as exc:
-        print(f"save_seen error: {exc}")
-
-
-def fetch_universe():
-    ex = get(f"{BINANCE}/api/v3/exchangeInfo")
-    tk = get(f"{BINANCE}/api/v3/ticker/price")
-    tk24 = get(f"{BINANCE}/api/v3/ticker/24hr")
-    if not ex or not tk or not tk24:
-        raise RuntimeError("Binance universe fetch failed")
-
-    px = {x["symbol"]: float(x["price"]) for x in tk}
-    vol = {x["symbol"]: float(x["quoteVolume"]) for x in tk24}
-
-    syms = []
-    for s in ex["symbols"]:
-        sym = s["symbol"]
-        if not sym.endswith("USDT"): continue
-        if s.get("status") != "TRADING": continue
-        if s.get("isSpotTradingAllowed") is False: continue
-        base = sym.removesuffix("USDT")
-        if base in STABLE: continue
-        p = px.get(sym, 0)
-        if not (0 < p < PRICE_CAP): continue
-        if vol.get(sym, 0) < 100000: continue
-        syms.append(sym)
-    return sorted(syms)
-
-
-def btc_regime():
-    """BTC 1h/4h/24h % change using ONLY completed 15m candles."""
-    k = get(f"{BINANCE}/api/v3/klines",
-            {"symbol": "BTCUSDT", "interval": "15m", "limit": 100})
-    if not k or len(k) < 98:
-        return None
-    try:
-        if int(k[-1][6]) >= time.time() * 1000:
-            k = k[:-1]
-        if len(k) < 97:
+        kline = fetch_latest_closed_kline(symbol, server_time_ms)
+        if kline is None:
             return None
-        c = [float(x[4]) for x in k]
-        return {
-            "1h":  (c[-1] / c[-5]  - 1) * 100,
-            "4h":  (c[-1] / c[-17] - 1) * 100,
-            "24h": (c[-1] / c[-97] - 1) * 100,
-        }
-    except (ValueError, IndexError):
-        return None
-
-
-def fetch_klines(sym):
-    k = get(f"{BINANCE}/api/v3/klines",
-            {"symbol": sym, "interval": "15m", "limit": BARS})
-    if not k or len(k) < 100:
-        return None
-    try:
-        if int(k[-1][6]) >= time.time() * 1000:
-            k = k[:-1]
-        if len(k) < 100:
+        candle = exact_t_candle(kline)
+        if candle is None:
             return None
-        o  = np.array([float(x[1]) for x in k], dtype=float)
-        h  = np.array([float(x[2]) for x in k], dtype=float)
-        l  = np.array([float(x[3]) for x in k], dtype=float)
-        c  = np.array([float(x[4]) for x in k], dtype=float)
-        v  = np.array([float(x[5]) for x in k], dtype=float)
-        tb = np.array([float(x[9]) for x in k], dtype=float)
-        return {"o": o, "h": h, "l": l, "c": c, "v": v, "tb": tb,
-                "open_ms": int(k[-1][0])}
-    except (ValueError, IndexError):
-        return None
-
-
-def ema(values, period):
-    out = np.zeros_like(values)
-    k = 2 / (period + 1)
-    out[0] = values[0]
-    for i in range(1, len(values)):
-        out[i] = values[i] * k + out[i-1] * (1 - k)
-    return out
-
-
-def check_signal(d):
-    o, h, l, c, v, tb = d["o"], d["h"], d["l"], d["c"], d["v"], d["tb"]
-    n = len(c)
-    if n < 60: return None
-
-    i = n - 1
-    resistance = h[max(0, i-48):i].max()
-    if resistance <= 0: return None
-    if c[i] <= resistance: return None
-
-    break_pct = (c[i] / resistance - 1) * 100
-    if break_pct > BREAK_MAX_PCT: return None
-
-    rng = h[i] - l[i]
-    if rng <= 0: return None
-    body = abs(c[i] - o[i]) / rng * 100
-    if body < BODY_MIN: return None
-    if c[i] < o[i]: return None
-
-    v_avg = v[max(0, i-8):i].mean()
-    if v_avg <= 0: return None
-    vol_x = v[i] / v_avg
-    if vol_x < VOL_X_MIN: return None
-
-    if v[i] <= 0: return None
-    taker = tb[i] / v[i]
-    if taker < TAKER_MIN: return None
-
-    e20 = ema(c, 20)
-    if c[i] <= e20[i]: return None
-
-    if i >= 16:
-        ret_4h = (c[i] / c[i-16] - 1) * 100
-        if ret_4h > RET_4H_MAX: return None
-    else:
-        return None
-
-    rng12 = (h[max(0, i-48):i].max() - l[max(0, i-48):i].min()) / l[max(0, i-48):i].min() * 100
-    if rng12 < RNG_12H_MIN: return None
-
-    return {
-        "entry": float(c[i]),
-        "break_pct": break_pct,
-        "body": body,
-        "vol_x": vol_x,
-        "taker": taker,
-    }
-
-
-def format_alert(sym, sig, btc):
-    entry = sig["entry"]
-    sl = entry * (1 + SL_PCT / 100)
-    tp = entry * (1 + TP_PCT / 100)
-    name = sym.removesuffix("USDT")
-    return (
-        f"🟢 <b>ENTRY</b>\n\n"
-        f"<b>{html.escape(name)}</b>\n"
-        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
-        f"<b>BREAK:</b> +{sig['break_pct']:.2f}%\n"
-        f"<b>BODY:</b> {sig['body']:.0f}%  <b>VOL:</b> {sig['vol_x']:.1f}x  <b>TAKER:</b> {sig['taker']:.2f}\n"
-        f"🛑 <b>SL:</b> {fmt_price(sl)} ({SL_PCT:+.0f}%)\n"
-        f"🎯 <b>TP:</b> {fmt_price(tp)} ({TP_PCT:+.0f}%)\n\n"
-        f"<i>BTC 4h {btc['4h']:+.2f}%  |  IST {ist_now().strftime('%H:%M')}</i>"
-    )
+        return symbol, candle
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        log.warning("Could not scan %s: %s", symbol, exc)
+        return "__SCAN_ERROR__", symbol
 
 
 def main():
-    print("=" * 60)
-    print("SCANNER STARTING — IST", ist_now().strftime("%Y-%m-%d %H:%M"))
-    print("=" * 60)
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID GitHub Actions secret")
 
-    btc = btc_regime()
-    if btc is None:
-        print("BTC fetch failed — alerting and abort")
-        telegram("⚠️ <b>Scanner:</b> BTC fetch failed. No signals this run.")
-        return
-    print(f"BTC 1h {btc['1h']:+.2f}%  4h {btc['4h']:+.2f}%  24h {btc['24h']:+.2f}%")
-
-    if btc["24h"] < BTC_24H_KILL:
-        print(f"KILL SWITCH: BTC 24h {btc['24h']:+.2f}% < {BTC_24H_KILL}% — no signals")
-        return
-    if btc["4h"] < BTC_4H_MIN:
-        print(f"BTC 4h {btc['4h']:+.2f}% < {BTC_4H_MIN}% — no signals")
-        return
-
-    try:
-        syms = fetch_universe()
-    except Exception as exc:
-        print(f"Universe error: {exc}")
-        telegram(f"⚠️ <b>Scanner:</b> universe fetch failed: {html.escape(str(exc))[:200]}")
-        return
-    print(f"Universe: {len(syms)} pairs < ${PRICE_CAP}")
+    log.info("Scanner started; rule: Body 0%%, Upper Wick 0%%, Lower Wick 100%%")
+    server_time_ms = fetch_server_time_ms()
+    symbols = fetch_universe()
+    expected_open_ms = (server_time_ms // INTERVAL_MS) * INTERVAL_MS - INTERVAL_MS
+    log.info("Binance Spot USDT pairs: %s", len(symbols))
+    log.info("Latest expected closed 15m candle open time (UTC ms): %s", expected_open_ms)
 
     hits = []
-    failed = 0
-
-    def worker(sym):
-        try:
-            d = fetch_klines(sym)
-            if d is None:
-                return ("FAIL", sym)
-            sig = check_signal(d)
-            if sig is None:
-                return None
-            return ("HIT", sym, sig, d["open_ms"])
-        except Exception as exc:
-            print(f"  worker error {sym}: {exc}")
-            return ("FAIL", sym)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = [pool.submit(worker, s) for s in syms]
-        for f in as_completed(futs):
+    scan_errors = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(scan_symbol, symbol, server_time_ms) for symbol in symbols]
+        for future in as_completed(futures):
             try:
-                r = f.result()
-            except Exception as exc:
-                failed += 1
-                print(f"  future error: {exc}")
+                result = future.result()
+            except Exception as exc:  # Keep one unexpected pair failure from aborting the full scan.
+                scan_errors += 1
+                log.warning("Unexpected worker failure: %s", exc)
                 continue
-            if r is None:
+            if result is None:
                 continue
-            if r[0] == "FAIL":
-                failed += 1
-            elif r[0] == "HIT":
-                hits.append((r[1], r[2], r[3]))
+            if result[0] == "__SCAN_ERROR__":
+                scan_errors += 1
+            else:
+                hits.append(result)
 
-    print(f"Checked: {len(syms) - failed}/{len(syms)}  (failed: {failed})")
-    print(f"Signals found: {len(hits)}")
+    log.info("Scan complete: %s pairs checked; %s errors; %s exact T matches", len(symbols), scan_errors, len(hits))
 
-    seen = load_seen()
-    cutoff = time.time() - SEEN_TTL_SEC
-    seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and v > cutoff}
+    now = time.time()
+    cutoff = now - SEEN_TTL_SEC
+    seen = {
+        key: timestamp
+        for key, timestamp in load_seen().items()
+        if isinstance(timestamp, (int, float)) and timestamp > cutoff
+    }
 
-    hits.sort(key=lambda x: x[1]["vol_x"], reverse=True)
     sent_count = 0
-    for sym, sig, open_ms in hits:
-        key = f"{sym}|{open_ms}"
+    failed_alerts = 0
+    for symbol, candle in sorted(hits, key=lambda item: item[0]):
+        key = f"{symbol}|{candle['open_time_ms']}"
         if key in seen:
-            print(f"  {sym}: already sent — skip")
+            log.info("Duplicate prevented: %s", key)
             continue
-        msg = format_alert(sym, sig, btc)
-        if telegram(msg):
+        if telegram(format_alert(symbol, candle)):
             seen[key] = time.time()
             sent_count += 1
-            print(f"  {sym}: sent  break {sig['break_pct']:+.2f}%  vol {sig['vol_x']:.1f}x")
+            log.info("Telegram alert sent: %s", symbol)
         else:
-            print(f"  {sym}: FAILED")
+            failed_alerts += 1
+            log.error("Telegram alert failed: %s", symbol)
 
-    save_seen(seen)
-    print(f"Sent: {sent_count}")
-    print("Done.")
+    if sent_count:
+        save_seen(seen)
+        set_github_output("cache_changed", "true")
+    else:
+        set_github_output("cache_changed", "false")
+
+    log.info("Finished: %s alerts sent; %s alert failures", sent_count, failed_alerts)
 
 
 if __name__ == "__main__":
