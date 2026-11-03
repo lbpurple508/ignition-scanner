@@ -59,7 +59,7 @@ class StagedTTSequenceTests(unittest.TestCase):
         self.non_t = make_kline(
             scanner.INTERVAL_MS, "98", "99", "90", "98"
         )
-        self.now = 10 * scanner.INTERVAL_MS
+        self.now = self.t2[6] + 1000
 
     def test_first_t_is_saved_and_does_not_alert(self):
         tracking, matches = scanner.advance_t_sequence(
@@ -109,7 +109,7 @@ class StagedTTSequenceTests(unittest.TestCase):
             scanner.exact_t_candle(self.t3),
         )
         tracking, matches = scanner.advance_t_sequence(
-            "BTCUSDT", [self.t4], initial, self.now
+            "BTCUSDT", [self.t4], initial, self.t4[6] + 1000
         )
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0][1]["open_time_ms"], 2 * scanner.INTERVAL_MS)
@@ -138,9 +138,10 @@ class StagedTTSequenceTests(unittest.TestCase):
 
     def test_pairs_are_non_overlapping_after_confirmation(self):
         initial = scanner.serialize_tracking(0, scanner.exact_t_candle(self.t1))
-        tracking, matches = scanner.advance_t_sequence(
-            "BTCUSDT", [self.t2, self.t3, self.t4], initial, self.now
-        )
+        with patch.object(scanner, "PENDING_TTL_MS", 3 * scanner.INTERVAL_MS):
+            tracking, matches = scanner.advance_t_sequence(
+                "BTCUSDT", [self.t2, self.t3, self.t4], initial, self.t4[6] + 1000
+            )
         self.assertEqual(len(matches), 2)
         self.assertEqual(
             [(m[1]["open_time_ms"], m[2]["open_time_ms"]) for m in matches],
@@ -179,7 +180,7 @@ class CandleFetchTests(unittest.TestCase):
         self.t3 = make_t(2 * scanner.INTERVAL_MS)
 
     def test_first_run_only_bootstraps_latest_closed_candle(self):
-        now = 3 * scanner.INTERVAL_MS + 100
+        now = 2 * scanner.INTERVAL_MS + 100
         with patch.object(scanner, "get_json", return_value=[self.t2, self.t3]) as get:
             with patch.object(scanner.time, "monotonic", return_value=50.0):
                 candles = scanner.fetch_new_closed_klines("BTCUSDT", now, 50.0, None)
@@ -206,7 +207,7 @@ class CandleFetchTests(unittest.TestCase):
         self.assertEqual(candles, [self.t2])
 
     def test_incomplete_candle_is_never_processed(self):
-        now = 2 * scanner.INTERVAL_MS + 100
+        now = 2 * scanner.INTERVAL_MS - 10
         with patch.object(scanner, "get_json", return_value=[self.t2]):
             with patch.object(scanner.time, "monotonic", return_value=50.0):
                 candles = scanner.fetch_new_closed_klines(
