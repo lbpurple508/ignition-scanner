@@ -187,24 +187,32 @@ def exact_t_candle(kline):
     }
 
 
-def fetch_latest_two_closed_klines(symbol, server_time_ms, server_time_monotonic):
-    """Fetch only the latest two fully closed, consecutive 15-minute candles.
+def fetch_new_closed_klines(
+    symbol, server_time_ms, server_time_monotonic, last_processed_open_time_ms=None
+):
+    """Fetch only unseen, fully closed candles for this symbol.
 
-    Advance Binance's server-time snapshot using monotonic elapsed time. This
-    prevents a scan that crosses a 15-minute boundary from treating a candle
-    that closed mid-scan as still forming (or alerting on an older pair).
+    First-ever run: inspect just the latest completed candle and save it as T1
+    (if it matches). Later runs: resume strictly after the saved candle cursor.
     """
-    klines = get_json(
-        "/api/v3/klines",
-        {"symbol": symbol, "interval": INTERVAL, "limit": 3},
-    )
+    if last_processed_open_time_ms is None:
+        params = {"symbol": symbol, "interval": INTERVAL, "limit": 2}
+    else:
+        params = {
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "startTime": int(last_processed_open_time_ms) + INTERVAL_MS,
+            "limit": 1000,
+        }
+
+    klines = get_json("/api/v3/klines", params)
     if not isinstance(klines, list):
-        return None
+        return []
 
     effective_server_time_ms = server_time_ms + int(
         (time.monotonic() - server_time_monotonic) * 1000
     )
-    closed = []
+    closed_by_open_time = {}
     for kline in klines:
         try:
             open_time_ms = int(kline[0])
@@ -212,21 +220,23 @@ def fetch_latest_two_closed_klines(symbol, server_time_ms, server_time_monotonic
         except (IndexError, TypeError, ValueError):
             continue
 
-        # A Binance 15m candle closes at open + 15m - 1ms.
         if close_time_ms >= effective_server_time_ms:
             continue
         if close_time_ms != open_time_ms + INTERVAL_MS - 1:
             continue
-        closed.append(kline)
+        if (
+            last_processed_open_time_ms is not None
+            and open_time_ms <= int(last_processed_open_time_ms)
+        ):
+            continue
+        closed_by_open_time[open_time_ms] = kline
 
-    if len(closed) < 2:
-        return None
-
-    first, second = closed[-2], closed[-1]
-    if int(second[0]) - int(first[0]) != INTERVAL_MS:
-        return None
-    return first, second
-
+    closed = [closed_by_open_time[key] for key in sorted(closed_by_open_time)]
+    if last_processed_open_time_ms is None:
+        # Do not back-scan and instantly alert on an old TT at first startup.
+        # The newest completed candle is T1; a future closed candle must be T2.
+        closed = closed[-1:]
+    return closed
 
 def fmt_price(value):
     text = format(value, "f")
@@ -309,26 +319,31 @@ def telegram(message):
 
 
 def load_state():
-    """Load current state and migrate the previous flat seen-signals JSON format."""
+    """Load seen/pending alerts and per-symbol staged T-candle progress."""
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"seen": {}, "pending": {}}
+        return {"seen": {}, "pending": {}, "tracking": {}}
     except (OSError, json.JSONDecodeError) as exc:
-        # Fail closed: silently resetting this file can resend previously delivered alerts.
         raise RuntimeError(
             "Scanner state is unreadable or corrupt; refusing to send alerts until it is repaired"
         ) from exc
 
     if not isinstance(data, dict):
         raise RuntimeError("Scanner state has an invalid format; refusing to send duplicate alerts")
-    if "seen" in data or "pending" in data:
+    if "seen" in data or "pending" in data or "tracking" in data:
         if not isinstance(data.get("seen"), dict) or not isinstance(data.get("pending"), dict):
             raise RuntimeError("Scanner state is incomplete or invalid; refusing to send duplicate alerts")
-        return {"seen": data["seen"], "pending": data["pending"]}
-    # Backward compatibility with the original {"SYMBOL|open_time": timestamp} file.
-    return {"seen": data, "pending": {}}
-
+        tracking = data.get("tracking", {})
+        if not isinstance(tracking, dict):
+            raise RuntimeError("Scanner tracking state is invalid; refusing to skip or duplicate candles")
+        return {
+            "seen": data["seen"],
+            "pending": data["pending"],
+            "tracking": tracking,
+        }
+    # Backward compatibility with the original flat seen-signals JSON file.
+    return {"seen": data, "pending": {}, "tracking": {}}
 
 def save_state(state):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -407,27 +422,103 @@ def deserialize_pending(record):
     return record["symbol"], first, second
 
 
-def scan_symbol(symbol, server_time_ms, server_time_monotonic):
-    """Return at most one signal: only the latest two closed candles may form TT."""
+def serialize_tracking(last_processed_open_time_ms, first_t):
+    """Persist a symbol's candle cursor and, when present, its first T candle."""
+    return {
+        "last_processed_open_time_ms": last_processed_open_time_ms,
+        "first_t": _serialize_t_candle(first_t) if first_t is not None else None,
+    }
+
+
+def deserialize_tracking(record):
+    if record is None:
+        return None, None
+    if not isinstance(record, dict):
+        raise ValueError("Invalid per-symbol tracking state")
+
+    last_processed = record.get("last_processed_open_time_ms")
+    if (
+        isinstance(last_processed, bool)
+        or not isinstance(last_processed, int)
+        or last_processed < 0
+    ):
+        raise ValueError("Invalid last-processed candle timestamp")
+
+    first_record = record.get("first_t")
+    first_t = _deserialize_t_candle(first_record) if first_record is not None else None
+    if first_t is not None and first_t["open_time_ms"] != last_processed:
+        raise ValueError("Waiting T candle does not match the last-processed candle")
+    return last_processed, first_t
+
+
+def advance_t_sequence(symbol, closed_klines, tracking_record, server_time_ms):
+    """Apply each new closed candle in order: T1 -> next candle T2 -> confirm TT.
+
+    A non-T next candle resets the sequence. After a confirmed pair, both candles
+    are consumed and the scanner waits for a fresh T1 (non-overlapping pairs).
+    """
+    last_processed, first_t = deserialize_tracking(tracking_record)
+    matches = []
+
+    for kline in sorted(closed_klines, key=lambda item: int(item[0])):
+        open_time_ms = int(kline[0])
+        if last_processed is not None and open_time_ms <= last_processed:
+            continue
+
+        # A missing 15-minute candle breaks consecutiveness.
+        if (
+            last_processed is not None
+            and open_time_ms != last_processed + INTERVAL_MS
+        ):
+            first_t = None
+
+        current_t = exact_t_candle(kline)
+        if current_t is None:
+            first_t = None
+        else:
+            if (
+                first_t is not None
+                and current_t["open_time_ms"] - first_t["open_time_ms"] == INTERVAL_MS
+            ):
+                # Do not send an old pair if cron was stopped for too long.
+                if current_t["close_time_ms"] >= server_time_ms - PENDING_TTL_MS:
+                    matches.append((symbol, first_t, current_t))
+                # T1 and T2 are consumed; wait for a completely new T1.
+                first_t = None
+            else:
+                first_t = current_t
+
+        last_processed = open_time_ms
+
+    if last_processed is None:
+        return tracking_record, matches
+    return serialize_tracking(last_processed, first_t), matches
+
+
+def scan_symbol(symbol, server_time_ms, server_time_monotonic, tracking_record=None):
+    """Resume this symbol's staged T1/T2 confirmation from persistent state."""
     try:
-        klines = fetch_latest_two_closed_klines(
-            symbol, server_time_ms, server_time_monotonic
+        last_processed, _ = deserialize_tracking(tracking_record)
+        closed_klines = fetch_new_closed_klines(
+            symbol,
+            server_time_ms,
+            server_time_monotonic,
+            last_processed,
         )
-        if klines is None:
-            return None
-        first = exact_t_candle(klines[0])
-        if first is None:
-            return None
-        second = exact_t_candle(klines[1])
-        if second is None:
-            return None
-        if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
-            return None
-        return symbol, first, second
-    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+        updated_tracking, matches = advance_t_sequence(
+            symbol, closed_klines, tracking_record, server_time_ms
+        )
+        return symbol, updated_tracking, matches
+    except (
+        requests.RequestException,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        InvalidOperation,
+    ) as exc:
         log.warning("Could not scan %s: %s", symbol, exc)
         return "__SCAN_ERROR__", symbol
-
 
 def set_github_output(name, value):
     output_path = os.environ.get("GITHUB_OUTPUT")
@@ -456,50 +547,83 @@ def run_scan():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
 
-    log.info("Scanner started in strict TT mode: latest two closed candles only; stocks excluded")
+    log.info(
+        "Scanner started in staged TT mode: store T1, wait for the next closed 15m candle, "
+        "then confirm only if T2 is also an exact T; stocks excluded"
+    )
+    state = load_state()
     server_time_ms = fetch_server_time_ms()
     server_time_monotonic = time.monotonic()
     symbols = fetch_universe()
     log.info("Binance Spot USDT pairs: %s", len(symbols))
 
+    updated_tracking = dict(state["tracking"])
     hits = []
     scan_errors = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(scan_symbol, symbol, server_time_ms, server_time_monotonic)
+        futures = {
+            executor.submit(
+                scan_symbol,
+                symbol,
+                server_time_ms,
+                server_time_monotonic,
+                state["tracking"].get(symbol),
+            ): symbol
             for symbol in symbols
-        ]
+        }
         for future in as_completed(futures):
+            symbol = futures[future]
             try:
                 result = future.result()
             except Exception as exc:
                 scan_errors += 1
-                log.warning("Unexpected worker failure: %s", type(exc).__name__)
+                log.warning("Unexpected worker failure for %s: %s", symbol, type(exc).__name__)
                 continue
-            if result is None:
-                continue
-            if isinstance(result, tuple) and len(result) == 2 and result[0] == "__SCAN_ERROR__":
+            if not isinstance(result, tuple) or not result:
                 scan_errors += 1
-            else:
-                hits.append(result)
+                continue
+            if result[0] == "__SCAN_ERROR__":
+                scan_errors += 1
+                continue
 
-    log.info("Scan complete: %s eligible crypto pairs checked; %s errors; %s latest-pair TT matches", len(symbols), scan_errors, len(hits))
+            result_symbol, tracking_record, symbol_hits = result
+            if tracking_record is not None:
+                updated_tracking[result_symbol] = tracking_record
+            hits.extend(symbol_hits)
 
-    state = load_state()
+    log.info(
+        "Scan complete: %s eligible crypto pairs checked; %s errors; %s TT sequences confirmed",
+        len(symbols),
+        scan_errors,
+        len(hits),
+    )
+
     now = time.time()
     cutoff = now - SEEN_TTL_SEC
     old_seen = state["seen"]
     old_pending = state["pending"]
-    # Purge legacy stock alerts and old TT alerts queued by earlier lookback logic.
+    old_tracking = state["tracking"]
+
     state["pending"] = prune_pending_alerts(old_pending, server_time_ms)
     state["seen"] = {
         key: timestamp
         for key, timestamp in old_seen.items()
-        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
-        and math.isfinite(float(timestamp)) and timestamp > cutoff
+        if isinstance(timestamp, (int, float))
+        and not isinstance(timestamp, bool)
+        and math.isfinite(float(timestamp))
+        and timestamp > cutoff
         and not is_stock_linked_symbol(key.split("|", 1)[0])
     }
-    state_changed = state["seen"] != old_seen or state["pending"] != old_pending
+    state["tracking"] = {
+        symbol: record
+        for symbol, record in updated_tracking.items()
+        if not is_stock_linked_symbol(symbol)
+    }
+    state_changed = (
+        state["seen"] != old_seen
+        or state["pending"] != old_pending
+        or state["tracking"] != old_tracking
+    )
 
     for symbol, first, second in hits:
         key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
@@ -507,7 +631,7 @@ def run_scan():
             state["pending"][key] = serialize_match(symbol, first, second)
             state_changed = True
 
-    # Persist matches before sending, so a temporary Telegram failure is retried next cron run.
+    # Save T1/cursors and newly confirmed TT alerts before Telegram delivery.
     if state_changed:
         save_state(state)
 
@@ -532,16 +656,20 @@ def run_scan():
             sent_count += 1
             state_changed = True
             save_state(state)
-            log.info("Telegram alert sent: %s", symbol)
+            log.info("Telegram TT confirmation sent: %s", symbol)
         else:
             failed_alerts += 1
-            log.error("Telegram alert failed and will retry on next run: %s", symbol)
+            log.error("Telegram alert failed and will retry on next cron run: %s", symbol)
 
     if state_changed:
         save_state(state)
     set_github_output("cache_changed", "true" if state_changed else "false")
-    log.info("Finished: %s alerts sent; %s alert failures; %s pending", sent_count, failed_alerts, len(state["pending"]))
-
+    log.info(
+        "Finished: %s TT confirmations sent; %s alert failures; %s pending",
+        sent_count,
+        failed_alerts,
+        len(state["pending"]),
+    )
 
 def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
