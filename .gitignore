@@ -1,0 +1,16 @@
+# Runtime state and secrets
+.scanner_state/
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local files
+*.log
+.DS_Store
+.vscode/
