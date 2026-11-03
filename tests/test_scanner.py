@@ -54,7 +54,7 @@ class LatestTTLogicTests(unittest.TestCase):
         self.t3 = make_kline(2 * scanner.INTERVAL_MS, "97", "97", "90", "97")
 
     def test_fetch_uses_only_latest_two_closed_candles(self):
-        now = 2 * scanner.INTERVAL_MS + 100
+        now = 3 * scanner.INTERVAL_MS + 100
         with patch.object(scanner, "get_json", return_value=[self.t1, self.t2, self.t3]):
             with patch.object(scanner.time, "monotonic", return_value=50.0):
                 pair = scanner.fetch_latest_two_closed_klines("BTCUSDT", now, 50.0)
@@ -152,9 +152,14 @@ class StateAndDeduplicationTests(unittest.TestCase):
         stock = scanner.serialize_match("GPROBUSDT", self.first, self.second)
         stock["second"]["close_time_ms"] = now_ms - 60_000
         kept = scanner.prune_pending_alerts(
-            {"recent": recent, "stale": stale, "stock": stock}, now_ms
+            {
+                "BTCUSDT|TT|0|900000": recent,
+                "ETHUSDT|TT|0|900000": stale,
+                "GPROBUSDT|TT|0|900000": stock,
+            },
+            now_ms,
         )
-        self.assertEqual(list(kept), ["recent"])
+        self.assertEqual(list(kept), ["BTCUSDT|TT|0|900000"])
 
     def test_corrupt_state_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
