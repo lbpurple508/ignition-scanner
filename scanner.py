@@ -35,6 +35,24 @@ LOCK_FILE = STATE_DIR / "scanner.lock"
 SEEN_TTL_SEC = 24 * 60 * 60
 IST = ZoneInfo("Asia/Kolkata")
 
+# Binance bStocks/tokenized-security base assets, compiled from Binance Spot listings.
+# This is deliberately an explicit list; do NOT exclude every ticker ending in "B",
+# because ordinary crypto assets such as BNB also end in B.
+STOCK_LINKED_ASSETS = frozenset({
+    "AAPLB", "AAOIB", "ADBEB", "ALABB", "AMATB", "AMCB", "AMDB", "AMZNB",
+    "APPB", "ARMB", "ASMLB", "ASTSB", "AVGOB", "BABAB", "BBB", "BEB",
+    "BMNRB", "BNCB", "BOTB", "BRKBB", "BSPB", "CBRSB", "COHRB", "COINB",
+    "CRCLB", "CRMB", "CRWDB", "CRDOB", "CYPHB", "DELLB", "DRAMB", "EWYB",
+    "FLNCB", "FWDIB", "GEVB", "GLWB", "GOOGLB", "GPROB", "GSB", "HIMSB",
+    "HOODB", "HPEB", "IBMB", "INTCB", "IRENB", "JPMB", "KSTRB", "LLYB",
+    "MARVLB", "MDBB", "MRNAB", "MRVLB", "MSTRB", "MUB", "NBISB", "NFLXB",
+    "NOKB", "NVDAB", "PDDB", "PENGB", "PYPLB", "QCOMB", "RDDTB", "RKLBB",
+    "SECZB", "SHAZB", "SMCIB", "SNDKB", "SMHB", "SOXLB", "SOXSB", "SPCXB",
+    "SPYB", "SQQQB", "STXB", "TSLAB", "TMFB", "TSMB", "USARB", "USDEB",
+    "UVXYB", "VSTB", "WDCB", "WENB", "ZMB", "SKDDB", "SKUUB",
+})
+TT_LOOKBACK_KLINES = 10
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ignition-scanner")
 _thread_local = threading.local()
@@ -95,14 +113,21 @@ def fetch_server_time_ms():
     return server_time
 
 
+def is_stock_linked_symbol(symbol):
+    """Return True for Binance-listed tokenized stock/security base assets."""
+    base_asset = symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
+    return base_asset in STOCK_LINKED_ASSETS
+
+
 def fetch_universe():
-    """Return every active Binance Spot symbol quoted in USDT; apply no market filters."""
+    """Return active Binance Spot USDT crypto pairs, excluding documented bStocks."""
     exchange_info = get_json("/api/v3/exchangeInfo")
     entries = exchange_info.get("symbols") if isinstance(exchange_info, dict) else None
     if not isinstance(entries, list):
         raise RuntimeError("Binance returned an invalid exchange-info response")
 
     symbols = []
+    excluded_stock_pairs = 0
     for item in entries:
         if not isinstance(item, dict):
             continue
@@ -110,12 +135,20 @@ def fetch_universe():
             continue
         if item.get("isSpotTradingAllowed") is False:
             continue
+
         symbol = item.get("symbol")
+        base_asset = item.get("baseAsset")
+        if not isinstance(base_asset, str) and isinstance(symbol, str) and symbol.endswith("USDT"):
+            base_asset = symbol[:-4]
+        if base_asset in STOCK_LINKED_ASSETS:
+            excluded_stock_pairs += 1
+            continue
         if isinstance(symbol, str) and symbol:
             symbols.append(symbol)
 
+    log.info("Excluded %s tokenized stock/security USDT pairs", excluded_stock_pairs)
     if not symbols:
-        raise RuntimeError("Binance returned no active USDT Spot pairs")
+        raise RuntimeError("Binance returned no eligible active crypto USDT Spot pairs")
     return sorted(set(symbols))
 
 
@@ -154,34 +187,31 @@ def exact_t_candle(kline):
     }
 
 
-def fetch_latest_two_closed_klines(symbol, server_time_ms):
-    """Fetch the latest two consecutive, fully closed 15-minute candles."""
+def fetch_recent_closed_klines(symbol, server_time_ms):
+    """Fetch a short history of fully closed 15-minute candles for TT detection."""
     klines = get_json(
         "/api/v3/klines",
-        {"symbol": symbol, "interval": INTERVAL, "limit": 3},
+        {"symbol": symbol, "interval": INTERVAL, "limit": TT_LOOKBACK_KLINES},
     )
     if not isinstance(klines, list):
-        return None
+        return []
 
     closed = []
     for kline in klines:
         try:
+            open_time_ms = int(kline[0])
             close_time_ms = int(kline[6])
         except (IndexError, TypeError, ValueError):
             continue
-        if close_time_ms < server_time_ms:
-            closed.append(kline)
 
-    if len(closed) < 2:
-        return None
+        # Binance 15m klines close at open time + interval - 1 ms.
+        if close_time_ms >= server_time_ms:
+            continue
+        if close_time_ms != open_time_ms + INTERVAL_MS - 1:
+            continue
+        closed.append(kline)
 
-    # Require two adjacent 15-minute intervals; do not join candles across a gap.
-    first_open_ms = int(closed[-2][0])
-    second_open_ms = int(closed[-1][0])
-    if second_open_ms - first_open_ms != INTERVAL_MS:
-        return None
-
-    return closed[-2], closed[-1]
+    return closed
 
 
 def fmt_price(value):
@@ -341,17 +371,21 @@ def deserialize_pending(record):
 
 def scan_symbol(symbol, server_time_ms):
     try:
-        klines = fetch_latest_two_closed_klines(symbol, server_time_ms)
-        if klines is None:
-            return None
-        first = exact_t_candle(klines[0])
-        second = exact_t_candle(klines[1])
-        if first is None or second is None:
-            return None
-        if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
-            return None
-        return symbol, first, second
-    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        klines = fetch_recent_closed_klines(symbol, server_time_ms)
+        matches = []
+        for first_raw, second_raw in zip(klines, klines[1:]):
+            # Only consecutive 15-minute candles can form a TT pair.
+            if int(second_raw[0]) - int(first_raw[0]) != INTERVAL_MS:
+                continue
+            first = exact_t_candle(first_raw)
+            if first is None:
+                continue
+            second = exact_t_candle(second_raw)
+            if second is None:
+                continue
+            matches.append((symbol, first, second))
+        return matches
+    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
         log.warning("Could not scan %s: %s", symbol, exc)
         return "__SCAN_ERROR__", symbol
 
@@ -383,7 +417,7 @@ def run_scan():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
 
-    log.info("Scanner started; rule: Body 0%%, Upper Wick 0%%, Lower Wick 100%%")
+    log.info("Scanner started in TT mode: two consecutive exact T candles; stocks excluded")
     server_time_ms = fetch_server_time_ms()
     symbols = fetch_universe()
     log.info("Binance Spot USDT pairs: %s", len(symbols))
@@ -401,24 +435,31 @@ def run_scan():
                 continue
             if result is None:
                 continue
-            if result[0] == "__SCAN_ERROR__":
+            if isinstance(result, tuple) and len(result) == 2 and result[0] == "__SCAN_ERROR__":
                 scan_errors += 1
             else:
-                hits.append(result)
+                hits.extend(result)
 
-    log.info("Scan complete: %s pairs checked; %s errors; %s exact T matches", len(symbols), scan_errors, len(hits))
+    log.info("Scan complete: %s eligible crypto pairs checked; %s errors; %s TT matches", len(symbols), scan_errors, len(hits))
 
     state = load_state()
     now = time.time()
     cutoff = now - SEEN_TTL_SEC
     old_seen = state["seen"]
+    old_pending = state["pending"]
+    # Drop tokenized stock/security alerts already queued by an older scanner version.
+    state["pending"] = {
+        key: record for key, record in old_pending.items()
+        if not is_stock_linked_symbol(key.split("|", 1)[0])
+    }
     state["seen"] = {
         key: timestamp
         for key, timestamp in old_seen.items()
         if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
         and math.isfinite(float(timestamp)) and timestamp > cutoff
+        and not is_stock_linked_symbol(key.split("|", 1)[0])
     }
-    state_changed = state["seen"] != old_seen
+    state_changed = state["seen"] != old_seen or state["pending"] != old_pending
 
     for symbol, first, second in hits:
         key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
