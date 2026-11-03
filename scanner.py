@@ -187,8 +187,13 @@ def exact_t_candle(kline):
     }
 
 
-def fetch_latest_two_closed_klines(symbol, server_time_ms):
-    """Fetch only the latest two fully closed, consecutive 15-minute candles."""
+def fetch_latest_two_closed_klines(symbol, server_time_ms, server_time_monotonic):
+    """Fetch only the latest two fully closed, consecutive 15-minute candles.
+
+    Advance Binance's server-time snapshot using monotonic elapsed time. This
+    prevents a scan that crosses a 15-minute boundary from treating a candle
+    that closed mid-scan as still forming (or alerting on an older pair).
+    """
     klines = get_json(
         "/api/v3/klines",
         {"symbol": symbol, "interval": INTERVAL, "limit": 3},
@@ -196,6 +201,9 @@ def fetch_latest_two_closed_klines(symbol, server_time_ms):
     if not isinstance(klines, list):
         return None
 
+    effective_server_time_ms = server_time_ms + int(
+        (time.monotonic() - server_time_monotonic) * 1000
+    )
     closed = []
     for kline in klines:
         try:
@@ -205,7 +213,7 @@ def fetch_latest_two_closed_klines(symbol, server_time_ms):
             continue
 
         # A Binance 15m candle closes at open + 15m - 1ms.
-        if close_time_ms >= server_time_ms:
+        if close_time_ms >= effective_server_time_ms:
             continue
         if close_time_ms != open_time_ms + INTERVAL_MS - 1:
             continue
@@ -307,16 +315,17 @@ def load_state():
     except FileNotFoundError:
         return {"seen": {}, "pending": {}}
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Could not read scanner state; starting with empty state: %s", exc)
-        return {"seen": {}, "pending": {}}
+        # Fail closed: silently resetting this file can resend previously delivered alerts.
+        raise RuntimeError(
+            "Scanner state is unreadable or corrupt; refusing to send alerts until it is repaired"
+        ) from exc
 
     if not isinstance(data, dict):
-        return {"seen": {}, "pending": {}}
+        raise RuntimeError("Scanner state has an invalid format; refusing to send duplicate alerts")
     if "seen" in data or "pending" in data:
-        return {
-            "seen": data.get("seen") if isinstance(data.get("seen"), dict) else {},
-            "pending": data.get("pending") if isinstance(data.get("pending"), dict) else {},
-        }
+        if not isinstance(data.get("seen"), dict) or not isinstance(data.get("pending"), dict):
+            raise RuntimeError("Scanner state is incomplete or invalid; refusing to send duplicate alerts")
+        return {"seen": data["seen"], "pending": data["pending"]}
     # Backward compatibility with the original {"SYMBOL|open_time": timestamp} file.
     return {"seen": data, "pending": {}}
 
@@ -398,10 +407,12 @@ def deserialize_pending(record):
     return record["symbol"], first, second
 
 
-def scan_symbol(symbol, server_time_ms):
+def scan_symbol(symbol, server_time_ms, server_time_monotonic):
     """Return at most one signal: only the latest two closed candles may form TT."""
     try:
-        klines = fetch_latest_two_closed_klines(symbol, server_time_ms)
+        klines = fetch_latest_two_closed_klines(
+            symbol, server_time_ms, server_time_monotonic
+        )
         if klines is None:
             return None
         first = exact_t_candle(klines[0])
@@ -447,13 +458,17 @@ def run_scan():
 
     log.info("Scanner started in strict TT mode: latest two closed candles only; stocks excluded")
     server_time_ms = fetch_server_time_ms()
+    server_time_monotonic = time.monotonic()
     symbols = fetch_universe()
     log.info("Binance Spot USDT pairs: %s", len(symbols))
 
     hits = []
     scan_errors = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(scan_symbol, symbol, server_time_ms) for symbol in symbols]
+        futures = [
+            executor.submit(scan_symbol, symbol, server_time_ms, server_time_monotonic)
+            for symbol in symbols
+        ]
         for future in as_completed(futures):
             try:
                 result = future.result()
