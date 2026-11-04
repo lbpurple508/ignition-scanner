@@ -84,7 +84,7 @@ class StagedTTSequenceTests(unittest.TestCase):
         self.assertEqual(matches[0][2]["open_time_ms"], scanner.INTERVAL_MS)
         last_processed, first_t = scanner.deserialize_tracking(tracking)
         self.assertEqual(last_processed, scanner.INTERVAL_MS)
-        self.assertIsNone(first_t)
+        self.assertEqual(first_t["open_time_ms"], scanner.INTERVAL_MS)
 
     def test_non_t_second_candle_resets_sequence(self):
         initial = scanner.serialize_tracking(0, scanner.exact_t_candle(self.t1))
@@ -117,7 +117,10 @@ class StagedTTSequenceTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0][1]["open_time_ms"], 2 * scanner.INTERVAL_MS)
         self.assertEqual(matches[0][2]["open_time_ms"], 3 * scanner.INTERVAL_MS)
-        self.assertIsNone(scanner.deserialize_tracking(tracking)[1])
+        self.assertEqual(
+            scanner.deserialize_tracking(tracking)[1]["open_time_ms"],
+            3 * scanner.INTERVAL_MS,
+        )
 
     def test_gap_breaks_sequence_but_current_t_can_start_again(self):
         gap_t = make_t(2 * scanner.INTERVAL_MS, "97", "89")
@@ -166,7 +169,10 @@ class StagedTTSequenceTests(unittest.TestCase):
             "BTCUSDT", [self.t2], initial, late_now
         )
         self.assertEqual(matches, [])
-        self.assertIsNone(scanner.deserialize_tracking(tracking)[1])
+        self.assertEqual(
+            scanner.deserialize_tracking(tracking)[1]["open_time_ms"],
+            scanner.INTERVAL_MS,
+        )
 
     def test_tracking_round_trip(self):
         first = scanner.exact_t_candle(self.t1)
