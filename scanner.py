@@ -51,6 +51,16 @@ STOCK_LINKED_ASSETS = frozenset({
     "SPYB", "SQQQB", "STXB", "TSLAB", "TMFB", "TSMB", "USARB", "USDEB",
     "UVXYB", "VSTB", "WDCB", "WENB", "ZMB", "SKDDB", "SKUUB",
 })
+
+# Fiat-pegged stablecoin base assets to exclude from USDT-quoted scanning.
+# USDT is intentionally NOT listed: it remains the quote asset for eligible pairs.
+STABLECOIN_ASSETS = frozenset({
+    "AEUR", "AUSD", "BIDR", "BUSD", "CRVUSD", "DAI", "EURI", "EURC",
+    "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT", "LUSD",
+    "MUSD", "OUSD", "PYUSD", "RLUSD", "SUSD", "TRYB", "TUSD", "U",
+    "USDB", "USDD", "USDE", "USDF", "USD0", "USD1", "USDG", "USDP",
+    "USDQ", "USDS", "USDTB", "USDX", "USDY", "USDC", "XUSD",
+})
 PENDING_TTL_MS = 30 * 60 * 1000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -119,8 +129,24 @@ def is_stock_linked_symbol(symbol):
     return base_asset in STOCK_LINKED_ASSETS
 
 
+def is_stablecoin_asset(base_asset):
+    """Return True for known fiat-pegged base assets; USDT is deliberately allowed as quote."""
+    return isinstance(base_asset, str) and base_asset in STABLECOIN_ASSETS and base_asset != "USDT"
+
+
+def is_stablecoin_symbol(symbol):
+    """Return True when a USDT pair's base asset is a known stablecoin."""
+    base_asset = symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
+    return is_stablecoin_asset(base_asset)
+
+
+def is_excluded_symbol(symbol):
+    """Return True for tokenized stocks or stablecoin base assets."""
+    return is_stock_linked_symbol(symbol) or is_stablecoin_symbol(symbol)
+
+
 def fetch_universe():
-    """Return active Binance Spot USDT crypto pairs, excluding documented bStocks."""
+    """Return active Binance Spot USDT crypto pairs, excluding bStocks and stablecoin bases."""
     exchange_info = get_json("/api/v3/exchangeInfo")
     entries = exchange_info.get("symbols") if isinstance(exchange_info, dict) else None
     if not isinstance(entries, list):
@@ -128,6 +154,7 @@ def fetch_universe():
 
     symbols = []
     excluded_stock_pairs = 0
+    excluded_stablecoin_pairs = 0
     for item in entries:
         if not isinstance(item, dict):
             continue
@@ -143,10 +170,14 @@ def fetch_universe():
         if base_asset in STOCK_LINKED_ASSETS:
             excluded_stock_pairs += 1
             continue
+        if is_stablecoin_asset(base_asset):
+            excluded_stablecoin_pairs += 1
+            continue
         if isinstance(symbol, str) and symbol:
             symbols.append(symbol)
 
     log.info("Excluded %s tokenized stock/security USDT pairs", excluded_stock_pairs)
+    log.info("Excluded %s stablecoin-base USDT pairs (USDT quote retained)", excluded_stablecoin_pairs)
     if not symbols:
         raise RuntimeError("Binance returned no eligible active crypto USDT Spot pairs")
     return sorted(set(symbols))
@@ -379,7 +410,7 @@ def prune_pending_alerts(pending, server_time_ms):
     kept = {}
     for key, record in pending.items():
         symbol = key.split("|", 1)[0] if isinstance(key, str) else ""
-        if is_stock_linked_symbol(symbol) or not isinstance(record, dict):
+        if is_excluded_symbol(symbol) or not isinstance(record, dict):
             continue
         second = record.get("second")
         if not isinstance(second, dict):
@@ -415,6 +446,8 @@ def _deserialize_t_candle(record):
 def deserialize_pending(record):
     if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
         raise ValueError("Invalid pending TT alert")
+    if is_excluded_symbol(record["symbol"]):
+        raise ValueError("Pending alert belongs to an excluded stock/stablecoin pair")
     first = _deserialize_t_candle(record["first"])
     second = _deserialize_t_candle(record["second"])
     if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
@@ -612,12 +645,12 @@ def run_scan():
         and not isinstance(timestamp, bool)
         and math.isfinite(float(timestamp))
         and timestamp > cutoff
-        and not is_stock_linked_symbol(key.split("|", 1)[0])
+        and not is_excluded_symbol(key.split("|", 1)[0])
     }
     state["tracking"] = {
         symbol: record
         for symbol, record in updated_tracking.items()
-        if not is_stock_linked_symbol(symbol)
+        if not is_excluded_symbol(symbol)
     }
     state_changed = (
         state["seen"] != old_seen

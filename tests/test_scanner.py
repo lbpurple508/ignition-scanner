@@ -223,12 +223,23 @@ class AssetUniverseTests(unittest.TestCase):
         self.assertFalse(scanner.is_stock_linked_symbol("BNBUSDT"))
         self.assertFalse(scanner.is_stock_linked_symbol("BTCUSDT"))
 
-    def test_universe_keeps_active_crypto_and_excludes_stock_tokens(self):
+    def test_stablecoin_bases_are_excluded_but_usdt_quote_is_kept(self):
+        for symbol in ("UUSDT", "USDEUSDT", "USDSUSDT", "USDCUSDT", "FDUSDUSDT"):
+            self.assertTrue(scanner.is_stablecoin_symbol(symbol), symbol)
+        self.assertFalse(scanner.is_stablecoin_asset("USDT"))
+        self.assertFalse(scanner.is_stablecoin_symbol("BTCUSDT"))
+        self.assertFalse(scanner.is_stablecoin_symbol("BNBUSDT"))
+
+    def test_universe_keeps_active_crypto_and_excludes_stock_and_stablecoin_tokens(self):
         payload = {
             "symbols": [
                 {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "BNBUSDT", "baseAsset": "BNB", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "GPROBUSDT", "baseAsset": "GPROB", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "UUSDT", "baseAsset": "U", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "USDEUSDT", "baseAsset": "USDE", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "USDSUSDT", "baseAsset": "USDS", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "USDTUSDT", "baseAsset": "USDT", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "ETHBTC", "baseAsset": "ETH", "quoteAsset": "BTC", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "OLDUSDT", "baseAsset": "OLD", "quoteAsset": "USDT", "status": "BREAK", "isSpotTradingAllowed": True},
             ]
@@ -255,6 +266,11 @@ class AlertStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scanner.deserialize_pending(record)
 
+    def test_pending_state_rejects_stablecoin_base(self):
+        record = scanner.serialize_match("USDEUSDT", self.first, self.second)
+        with self.assertRaises(ValueError):
+            scanner.deserialize_pending(record)
+
     def test_stale_and_stock_pending_alerts_are_removed(self):
         now_ms = 10 * scanner.INTERVAL_MS
         recent = scanner.serialize_match("BTCUSDT", self.first, self.second)
@@ -263,11 +279,14 @@ class AlertStateTests(unittest.TestCase):
         stale["second"]["close_time_ms"] = now_ms - scanner.PENDING_TTL_MS - 1
         stock = scanner.serialize_match("GPROBUSDT", self.first, self.second)
         stock["second"]["close_time_ms"] = now_ms - 60_000
+        stable = scanner.serialize_match("USDEUSDT", self.first, self.second)
+        stable["second"]["close_time_ms"] = now_ms - 60_000
         kept = scanner.prune_pending_alerts(
             {
                 "BTCUSDT|TT|0|900000": recent,
                 "ETHUSDT|TT|0|900000": stale,
                 "GPROBUSDT|TT|0|900000": stock,
+                "USDEUSDT|TT|0|900000": stable,
             },
             now_ms,
         )
