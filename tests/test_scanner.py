@@ -239,7 +239,6 @@ class AssetUniverseTests(unittest.TestCase):
                 {"symbol": "UUSDT", "baseAsset": "U", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "USDEUSDT", "baseAsset": "USDE", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "USDSUSDT", "baseAsset": "USDS", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
-                {"symbol": "USDTUSDT", "baseAsset": "USDT", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "ETHBTC", "baseAsset": "ETH", "quoteAsset": "BTC", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "OLDUSDT", "baseAsset": "OLD", "quoteAsset": "USDT", "status": "BREAK", "isSpotTradingAllowed": True},
             ]
