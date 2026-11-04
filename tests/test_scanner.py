@@ -49,6 +49,9 @@ class ExactTDefinitionTests(unittest.TestCase):
     def test_nonfinite_values_are_rejected(self):
         self.assertIsNone(scanner.exact_t_candle(make_kline(0, "NaN", "NaN", "1", "NaN")))
 
+    def test_misaligned_candle_timestamps_are_rejected(self):
+        self.assertIsNone(scanner.exact_t_candle(make_t(1)))
+
 
 class StagedTTSequenceTests(unittest.TestCase):
     def setUp(self):
@@ -136,21 +139,25 @@ class StagedTTSequenceTests(unittest.TestCase):
         self.assertEqual(matches, [])
         self.assertEqual(tracking, initial)
 
-    def test_pairs_are_non_overlapping_after_confirmation(self):
+    def test_every_adjacent_pair_in_a_run_of_t_candles_is_reported_once(self):
         initial = scanner.serialize_tracking(0, scanner.exact_t_candle(self.t1))
         with patch.object(scanner, "PENDING_TTL_MS", 3 * scanner.INTERVAL_MS):
             tracking, matches = scanner.advance_t_sequence(
                 "BTCUSDT", [self.t2, self.t3, self.t4], initial, self.t4[6] + 1000
             )
-        self.assertEqual(len(matches), 2)
+        self.assertEqual(len(matches), 3)
         self.assertEqual(
             [(m[1]["open_time_ms"], m[2]["open_time_ms"]) for m in matches],
             [
                 (0, scanner.INTERVAL_MS),
+                (scanner.INTERVAL_MS, 2 * scanner.INTERVAL_MS),
                 (2 * scanner.INTERVAL_MS, 3 * scanner.INTERVAL_MS),
             ],
         )
-        self.assertIsNone(scanner.deserialize_tracking(tracking)[1])
+        self.assertEqual(
+            scanner.deserialize_tracking(tracking)[1]["open_time_ms"],
+            3 * scanner.INTERVAL_MS,
+        )
 
     def test_stale_second_t_is_not_alerted(self):
         initial = scanner.serialize_tracking(0, scanner.exact_t_candle(self.t1))
@@ -224,7 +231,7 @@ class AssetUniverseTests(unittest.TestCase):
         self.assertFalse(scanner.is_stock_linked_symbol("BTCUSDT"))
 
     def test_stablecoin_bases_are_excluded_but_usdt_quote_is_kept(self):
-        for symbol in ("UUSDT", "USDEUSDT", "USDSUSDT", "USDCUSDT", "FDUSDUSDT"):
+        for symbol in ("UUSDT", "USDEUSDT", "USDSUSDT", "USDCUSDT", "FDUSDUSDT", "KGSTUSDT", "BFUSDUSDT"):
             self.assertTrue(scanner.is_stablecoin_symbol(symbol), symbol)
         self.assertFalse(scanner.is_stablecoin_asset("USDT"))
         self.assertFalse(scanner.is_stablecoin_symbol("BTCUSDT"))
@@ -239,6 +246,8 @@ class AssetUniverseTests(unittest.TestCase):
                 {"symbol": "UUSDT", "baseAsset": "U", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "USDEUSDT", "baseAsset": "USDE", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "USDSUSDT", "baseAsset": "USDS", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "KGSTUSDT", "baseAsset": "KGST", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "BFUSDUSDT", "baseAsset": "BFUSD", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "ETHBTC", "baseAsset": "ETH", "quoteAsset": "BTC", "status": "TRADING", "isSpotTradingAllowed": True},
                 {"symbol": "OLDUSDT", "baseAsset": "OLD", "quoteAsset": "USDT", "status": "BREAK", "isSpotTradingAllowed": True},
             ]
@@ -267,6 +276,12 @@ class AlertStateTests(unittest.TestCase):
 
     def test_pending_state_rejects_stablecoin_base(self):
         record = scanner.serialize_match("USDEUSDT", self.first, self.second)
+        with self.assertRaises(ValueError):
+            scanner.deserialize_pending(record)
+
+    def test_pending_state_rejects_bad_candle_close_timestamp(self):
+        record = scanner.serialize_match("BTCUSDT", self.first, self.second)
+        record["second"]["close_time_ms"] += 1
         with self.assertRaises(ValueError):
             scanner.deserialize_pending(record)
 

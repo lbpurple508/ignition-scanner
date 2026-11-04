@@ -52,14 +52,15 @@ STOCK_LINKED_ASSETS = frozenset({
     "UVXYB", "VSTB", "WDCB", "WENB", "ZMB", "SKDDB", "SKUUB",
 })
 
-# Fiat-pegged stablecoin base assets to exclude from USDT-quoted scanning.
+# Fiat-pegged or stable-index base assets to exclude from USDT-quoted scanning.
 # USDT is intentionally NOT listed: it remains the quote asset for eligible pairs.
 STABLECOIN_ASSETS = frozenset({
-    "AEUR", "AUSD", "BIDR", "BUSD", "CRVUSD", "DAI", "EURI", "EURC",
-    "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT", "LUSD",
-    "MUSD", "OUSD", "PYUSD", "RLUSD", "SUSD", "TRYB", "TUSD", "U",
-    "USDB", "USDD", "USDE", "USDF", "USD0", "USD1", "USDG", "USDP",
-    "USDQ", "USDS", "USDTB", "USDX", "USDY", "USDC", "XUSD",
+    "AEUR", "AUSD", "BIDR", "BFUSD", "BUSD", "CRVUSD", "DAI", "EURI",
+    "EURC", "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT",
+    "KGST", "LUSD", "MUSD", "OUSD", "PYUSD", "RLUSD", "SUSD", "TRYB",
+    "TUSD", "U", "USDB", "USDD", "USDE", "USDF", "USD0", "USD1",
+    "USDG", "USDP", "USDQ", "USDS", "USDTB", "USDX", "USDY", "USDC",
+    "XUSD",
 })
 PENDING_TTL_MS = 30 * 60 * 1000
 
@@ -121,6 +122,12 @@ def fetch_server_time_ms():
     if server_time <= 0:
         raise RuntimeError("Binance returned an invalid server time")
     return server_time
+
+
+def effective_server_time_ms(server_time_ms, server_time_monotonic):
+    """Advance the Binance server-time snapshot by elapsed monotonic time."""
+    elapsed_ms = max(0, int((time.monotonic() - server_time_monotonic) * 1000))
+    return server_time_ms + elapsed_ms
 
 
 def is_stock_linked_symbol(symbol):
@@ -202,6 +209,12 @@ def exact_t_candle(kline):
     prices = (open_price, high_price, low_price, close_price)
     if not all(price.is_finite() for price in prices):
         return None
+    if (
+        open_time_ms < 0
+        or open_time_ms % INTERVAL_MS != 0
+        or close_time_ms != open_time_ms + INTERVAL_MS - 1
+    ):
+        return None
     if not (open_price == high_price == close_price and low_price < high_price):
         return None
 
@@ -238,11 +251,9 @@ def fetch_new_closed_klines(
 
     klines = get_json("/api/v3/klines", params)
     if not isinstance(klines, list):
-        return []
+        raise ValueError(f"Binance returned a malformed kline response for {symbol}")
 
-    effective_server_time_ms = server_time_ms + int(
-        (time.monotonic() - server_time_monotonic) * 1000
-    )
+    effective_time_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
     closed_by_open_time = {}
     for kline in klines:
         try:
@@ -251,7 +262,9 @@ def fetch_new_closed_klines(
         except (IndexError, TypeError, ValueError):
             continue
 
-        if close_time_ms >= effective_server_time_ms:
+        if close_time_ms >= effective_time_ms:
+            continue
+        if open_time_ms < 0 or open_time_ms % INTERVAL_MS != 0:
             continue
         if close_time_ms != open_time_ms + INTERVAL_MS - 1:
             continue
@@ -438,6 +451,15 @@ def _deserialize_t_candle(record):
         "upper_wick_pct": Decimal("0"),
         "lower_wick_pct": Decimal("100"),
     }
+    prices = (candle["open"], candle["high"], candle["low"], candle["close"])
+    if not all(price.is_finite() for price in prices):
+        raise ValueError("Pending candle contains a non-finite price")
+    if (
+        candle["open_time_ms"] < 0
+        or candle["open_time_ms"] % INTERVAL_MS != 0
+        or candle["close_time_ms"] != candle["open_time_ms"] + INTERVAL_MS - 1
+    ):
+        raise ValueError("Pending candle has invalid 15-minute timestamps")
     if not (candle["open"] == candle["high"] == candle["close"] and candle["low"] < candle["high"]):
         raise ValueError("Pending candle does not satisfy the exact T-candle rule")
     return candle
@@ -474,6 +496,7 @@ def deserialize_tracking(record):
         isinstance(last_processed, bool)
         or not isinstance(last_processed, int)
         or last_processed < 0
+        or last_processed % INTERVAL_MS != 0
     ):
         raise ValueError("Invalid last-processed candle timestamp")
 
@@ -516,8 +539,9 @@ def advance_t_sequence(symbol, closed_klines, tracking_record, server_time_ms):
                 # Do not send an old pair if cron was stopped for too long.
                 if current_t["close_time_ms"] >= server_time_ms - PENDING_TTL_MS:
                     matches.append((symbol, first_t, current_t))
-                # T1 and T2 are consumed; wait for a completely new T1.
-                first_t = None
+                # This T2 may also be T1 of the next adjacent TT pair.
+                # The timestamp-based key still prevents the same pair repeating.
+                first_t = current_t
             else:
                 first_t = current_t
 
@@ -538,8 +562,9 @@ def scan_symbol(symbol, server_time_ms, server_time_monotonic, tracking_record=N
             server_time_monotonic,
             last_processed,
         )
+        sequence_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
         updated_tracking, matches = advance_t_sequence(
-            symbol, closed_klines, tracking_record, server_time_ms
+            symbol, closed_klines, tracking_record, sequence_now_ms
         )
         return symbol, updated_tracking, matches
     except (
@@ -637,7 +662,8 @@ def run_scan():
     old_pending = state["pending"]
     old_tracking = state["tracking"]
 
-    state["pending"] = prune_pending_alerts(old_pending, server_time_ms)
+    state_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
+    state["pending"] = prune_pending_alerts(old_pending, state_now_ms)
     state["seen"] = {
         key: timestamp
         for key, timestamp in old_seen.items()
@@ -677,6 +703,9 @@ def run_scan():
             continue
         try:
             symbol, first, second = deserialize_pending(state["pending"][key])
+            expected_key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
+            if key != expected_key:
+                raise ValueError("Pending alert key does not match its candle data")
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             log.error("Removing invalid pending alert %s: %s", key, exc)
             del state["pending"][key]
