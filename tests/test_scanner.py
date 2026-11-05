@@ -111,6 +111,18 @@ class KlineParsingTests(unittest.TestCase):
                 scanner.ONE_MINUTE_MS,
             )
 
+    def test_rejects_inconsistent_zero_base_and_quote_volume(self):
+        with self.assertRaises(ValueError):
+            scanner.parse_kline(
+                make_kline(0, base_volume="0", quote_volume="1200", taker_buy_base="0"),
+                scanner.ONE_MINUTE_MS,
+            )
+        with self.assertRaises(ValueError):
+            scanner.parse_kline(
+                make_kline(0, base_volume="100", quote_volume="0", taker_buy_base="55"),
+                scanner.ONE_MINUTE_MS,
+            )
+
 
 class FeatureCalculationTests(unittest.TestCase):
     def test_calculates_report_features_from_30_bars(self):
@@ -199,6 +211,10 @@ class FilterThresholdTests(unittest.TestCase):
         self.assertFalse(scanner.passes_pump_filter(make_features(last_close=None)))
         self.assertFalse(scanner.passes_pump_filter(make_features(prior_24h_quote_per_minute="0")))
 
+    def test_string_timestamps_in_persisted_features_fail_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(window_start_ms="0")))
+        self.assertFalse(scanner.passes_pump_filter(make_features(window_end_ms=str(30 * scanner.ONE_MINUTE_MS - 1))))
+
     def test_overflowing_counts_fail_closed(self):
         self.assertFalse(scanner.passes_pump_filter(make_features(g4h_count=float("inf"))))
 
@@ -231,6 +247,11 @@ class UniverseTests(unittest.TestCase):
 class BaselineAndWindowFetchTests(unittest.TestCase):
     def test_server_time_rejects_fractional_timestamp(self):
         with patch.object(scanner, "get_json", return_value={"serverTime": "1700000000000.5"}):
+            with self.assertRaises(ValueError):
+                scanner.fetch_server_time_ms()
+
+    def test_server_time_rejects_huge_timestamp_before_integer_cast(self):
+        with patch.object(scanner, "get_json", return_value={"serverTime": "1e1000000000"}):
             with self.assertRaises(ValueError):
                 scanner.fetch_server_time_ms()
 
@@ -326,6 +347,14 @@ class ScheduleAndStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "state.json"
             state_file.write_text("{bad json", encoding="utf-8")
+            with patch.object(scanner, "STATE_FILE", state_file):
+                with self.assertRaises(RuntimeError):
+                    scanner.load_state()
+
+    def test_non_utf8_state_fails_closed_with_runtime_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_bytes(b"\\xff\\xfe")
             with patch.object(scanner, "STATE_FILE", state_file):
                 with self.assertRaises(RuntimeError):
                     scanner.load_state()
