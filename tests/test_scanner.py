@@ -123,6 +123,13 @@ class KlineParsingTests(unittest.TestCase):
                 scanner.ONE_MINUTE_MS,
             )
 
+    def test_rejects_zero_volume_candle_with_price_range(self):
+        with self.assertRaises(ValueError):
+            scanner.parse_kline(
+                make_kline(0, "100", "101", "99", "100", "0", "0", "0"),
+                scanner.ONE_MINUTE_MS,
+            )
+
 
 class FeatureCalculationTests(unittest.TestCase):
     def test_calculates_report_features_from_30_bars(self):
@@ -239,6 +246,8 @@ class UniverseTests(unittest.TestCase):
             {"symbol":"USDEUSDT","baseAsset":"USDE","quoteAsset":"USDT","status":"TRADING","isSpotTradingAllowed":True},
             {"symbol":"GPROBUSDT","baseAsset":"GPROB","quoteAsset":"USDT","status":"TRADING","isSpotTradingAllowed":True},
             {"symbol":"OLDUSDT","baseAsset":"OLD","quoteAsset":"USDT","status":"BREAK","isSpotTradingAllowed":True},
+            {"symbol":"MISSINGFLAGUSDT","baseAsset":"MISSINGFLAG","quoteAsset":"USDT","status":"TRADING"},
+            {"symbol":"MISSINGBASEUSDT","quoteAsset":"USDT","status":"TRADING","isSpotTradingAllowed":True},
         ]}
         with patch.object(scanner, "get_json", return_value=payload):
             self.assertEqual(scanner.fetch_universe(), ["BNBUSDT", "BTCUSDT"])
