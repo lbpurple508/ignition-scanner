@@ -657,11 +657,24 @@ def telegram(message):
                 parameters = result.get("parameters")
                 retry_after = parameters.get("retry_after", 2) if isinstance(parameters, dict) else 2
                 try:
+                    if isinstance(retry_after, bool):
+                        raise ValueError("Boolean retry_after")
                     delay = int(retry_after)
-                except (TypeError, ValueError):
-                    delay = 2
+                    if str(delay) != str(retry_after).strip() and not isinstance(retry_after, int):
+                        raise ValueError("Non-integer retry_after")
+                    if delay < 0:
+                        raise ValueError("Negative retry_after")
+                except (TypeError, ValueError, OverflowError):
+                    log.warning("Telegram returned an invalid retry_after value; deferring candidate")
+                    return False
                 if attempt < 2:
-                    time.sleep(min(max(delay, 1), 30))
+                    if delay > 30:
+                        log.warning(
+                            "Telegram requested a %s-second cooldown; deferring candidate to the next scan",
+                            delay,
+                        )
+                        return False
+                    time.sleep(max(delay, 1))
                     continue
                 return False
 
