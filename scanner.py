@@ -183,6 +183,9 @@ def fetch_universe():
             continue
         if not isinstance(base_asset, str):
             base_asset = base_asset_from_symbol(symbol)
+        # Exchange metadata must agree with the symbol suffix; fail closed on malformed rows.
+        if base_asset != base_asset_from_symbol(symbol) or not base_asset.isascii():
+            continue
 
         if base_asset in STOCK_LINKED_ASSETS:
             excluded_stocks += 1
@@ -293,6 +296,9 @@ def fetch_completed_1m_window(symbol, server_time_ms, server_time_monotonic):
         if close_ms >= now_ms:
             continue
         bar = parse_kline(row, ONE_MINUTE_MS)
+        if bar["open_time_ms"] in completed:
+            log.warning("Duplicate 1m candle timestamp for %s; skipping incomplete window", symbol)
+            return None
         completed[bar["open_time_ms"]] = bar
 
     bars = [completed[key] for key in sorted(completed)]
@@ -448,6 +454,39 @@ def passes_pump_filter(features):
     if g4h_count < 0 or valid_count < 0:
         return False
 
+    # Reject malformed persisted or externally supplied metrics before applying thresholds.
+    try:
+        start_ms = int(features["window_start_ms"])
+        end_ms = int(features["window_end_ms"])
+        invalid_count = int(features["invalid_candles"])
+        if (
+            isinstance(features["window_start_ms"], bool)
+            or isinstance(features["window_end_ms"], bool)
+            or Decimal(str(features["window_start_ms"])) != Decimal(start_ms)
+            or Decimal(str(features["window_end_ms"])) != Decimal(end_ms)
+            or Decimal(str(features["g4h_count"])) != Decimal(g4h_count)
+            or Decimal(str(features["valid_candles"])) != Decimal(valid_count)
+            or Decimal(str(features["invalid_candles"])) != Decimal(invalid_count)
+        ):
+            return False
+    except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
+        return False
+
+    if end_ms - start_ms != WINDOW_CANDLES * ONE_MINUTE_MS - 1:
+        return False
+    if not (MIN_VALID_CANDLES <= valid_count <= WINDOW_CANDLES):
+        return False
+    if invalid_count != WINDOW_CANDLES - valid_count or g4h_count < 0:
+        return False
+    if (
+        vol_peak < 0
+        or volume_acceleration < 0
+        or not (Decimal("0") <= taker_buy <= Decimal("1"))
+        or not (Decimal("0") <= lower_density <= Decimal("1"))
+        or quote_per_minute < 0
+    ):
+        return False
+
     return (
         vol_peak < MAX_VOL_PEAK_RATIO
         and volume_acceleration < MAX_VOLUME_ACCELERATION
@@ -455,7 +494,6 @@ def passes_pump_filter(features):
         and lower_density >= MIN_LOWER_WICK_DENSITY
         and g4h_count == REQUIRED_G4H_COUNT
         and quote_per_minute >= MIN_QUOTE_VOLUME_PER_MINUTE
-        and valid_count >= MIN_VALID_CANDLES
     )
 
 
@@ -607,12 +645,23 @@ def deserialize_candidate(record):
     if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
         raise ValueError("Invalid pending pre-pump candidate")
     symbol = record["symbol"]
+    if (
+        not symbol.isascii()
+        or symbol != symbol.upper()
+        or not symbol.endswith("USDT")
+        or len(symbol) <= 4
+        or not symbol[:-4].isalnum()
+    ):
+        raise ValueError("Pending candidate has an invalid Binance symbol")
     if is_excluded_symbol(symbol):
         raise ValueError("Candidate belongs to an excluded stock/stablecoin pair")
     features = record.get("features")
     if not passes_pump_filter(features):
         raise ValueError("Pending candidate no longer satisfies the pre-pump filter")
-    signal_time_ms = int(record["signal_time_ms"])
+    raw_signal_time = record["signal_time_ms"]
+    signal_time_ms = int(raw_signal_time)
+    if isinstance(raw_signal_time, bool) or Decimal(str(raw_signal_time)) != Decimal(signal_time_ms):
+        raise ValueError("Pending signal timestamp is not an integer")
     if signal_time_ms != int(features["window_end_ms"]):
         raise ValueError("Pending signal timestamp does not match feature window")
     return symbol, features, signal_time_ms
