@@ -659,22 +659,20 @@ def telegram(message):
                 try:
                     if isinstance(retry_after, bool):
                         raise ValueError("Boolean retry_after")
-                    delay = int(retry_after)
-                    if str(delay) != str(retry_after).strip() and not isinstance(retry_after, int):
-                        raise ValueError("Non-integer retry_after")
-                    if delay < 0:
-                        raise ValueError("Negative retry_after")
-                except (TypeError, ValueError, OverflowError):
+                    delay_number = as_decimal(retry_after, "Telegram retry_after")
+                    if delay_number != delay_number.to_integral_value() or delay_number < 0:
+                        raise ValueError("Invalid retry_after")
+                except (TypeError, ValueError, InvalidOperation, OverflowError):
                     log.warning("Telegram returned an invalid retry_after value; deferring candidate")
                     return False
                 if attempt < 2:
-                    if delay > 30:
+                    if delay_number > 30:
                         log.warning(
                             "Telegram requested a %s-second cooldown; deferring candidate to the next scan",
-                            delay,
+                            delay_number,
                         )
                         return False
-                    time.sleep(max(delay, 1))
+                    time.sleep(max(int(delay_number), 1))
                     continue
                 return False
 
