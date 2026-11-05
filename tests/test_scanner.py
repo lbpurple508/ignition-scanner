@@ -170,6 +170,20 @@ class FilterThresholdTests(unittest.TestCase):
     def test_nonfinite_feature_fails_closed(self):
         self.assertFalse(scanner.passes_pump_filter(make_features(vol_peak_ratio="NaN")))
 
+    def test_negative_metrics_fail_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(vol_peak_ratio="-1")))
+        self.assertFalse(scanner.passes_pump_filter(make_features(volume_acceleration="-0.1")))
+
+    def test_wick_density_above_one_fails_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(lower_wick_density="1.01")))
+
+    def test_fractional_counts_fail_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(g4h_count="0.5")))
+        self.assertFalse(scanner.passes_pump_filter(make_features(valid_candles="20.5")))
+
+    def test_inconsistent_window_duration_fails_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(window_end_ms=1)))
+
 
 class UniverseTests(unittest.TestCase):
     def test_stablecoin_and_stock_assets_are_excluded(self):
@@ -236,6 +250,14 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
             with patch.object(scanner.time, "monotonic", return_value=10.0):
                 self.assertIsNone(scanner.fetch_completed_1m_window("BTCUSDT", now, 10.0))
 
+    def test_duplicate_minute_makes_window_unusable(self):
+        rows = [make_kline(index) for index in range(31)]
+        rows.append(rows[-1])
+        now = 31 * scanner.ONE_MINUTE_MS + 100
+        with patch.object(scanner, "get_json", return_value=rows):
+            with patch.object(scanner.time, "monotonic", return_value=10.0):
+                self.assertIsNone(scanner.fetch_completed_1m_window("BTCUSDT", now, 10.0))
+
 
 class ScheduleAndStateTests(unittest.TestCase):
     def test_research_window_is_0530_to_1800_ist(self):
@@ -273,6 +295,11 @@ class ScheduleAndStateTests(unittest.TestCase):
 
     def test_pending_candidate_rejects_failed_filter(self):
         candidate = scanner.serialize_candidate("BTCUSDT", make_features(g4h_count=1))
+        with self.assertRaises(ValueError):
+            scanner.deserialize_candidate(candidate)
+
+    def test_pending_candidate_rejects_malformed_symbol(self):
+        candidate = scanner.serialize_candidate("BTC/USDT", make_features())
         with self.assertRaises(ValueError):
             scanner.deserialize_candidate(candidate)
 
