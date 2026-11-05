@@ -352,7 +352,7 @@ class ScheduleAndStateTests(unittest.TestCase):
             "BTC/USDT|1970-01-01": now,
             "UUSDT|1970-01-01": now,
             "BTCUSDT|1970-01-01|extra": now,
-            "BTCUSDT|1970-01-01": 10 ** 10000,
+            "XRPUSDT|1970-01-01": 10 ** 10000,
             "ETHUSDT|1970-01-01": float("nan"),
         }
         cleaned = scanner.prune_seen(malformed, now_seconds=now)
