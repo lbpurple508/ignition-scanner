@@ -611,13 +611,15 @@ def fmt_decimal(value, places=3):
 def format_alert(symbol, features, signal_time_ms):
     signal_time_ms = as_integer(signal_time_ms, "alert signal timestamp")
     window_start_ms = as_integer(features["window_start_ms"], "alert window start")
+    window_end_ms = as_integer(features["window_end_ms"], "alert window end")
     signal_time = datetime_from_ms(signal_time_ms).astimezone(IST)
     start_time = datetime_from_ms(window_start_ms).astimezone(IST)
+    end_time = datetime_from_ms(window_end_ms + 1).astimezone(IST)
     return (
         "🟡 <b>PRE-PUMP FILTER MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
         f"<b>Signal time:</b> {signal_time:%Y-%m-%d %H:%M:%S} IST\n"
-        f"<b>30m window:</b> {start_time:%H:%M}–{signal_time:%H:%M} IST\n"
+        f"<b>30m window:</b> {start_time:%H:%M}–{end_time:%H:%M} IST\n"
         "<b>Status:</b> Research candidate only — not a confirmed pump or trade entry\n\n"
         f"<b>VolPeak / prior 24h avg:</b> {fmt_decimal(features['vol_peak_ratio'])}x (limit &lt;100)\n"
         f"<b>Volume acceleration:</b> {fmt_decimal(features['volume_acceleration'])}x (limit &lt;0.50)\n"
