@@ -552,17 +552,22 @@ def passes_pump_filter(features):
     )
 
 
+def datetime_from_ms(timestamp_ms):
+    """Convert epoch milliseconds without a float round-trip."""
+    timestamp_ms = as_integer(timestamp_ms, "timestamp")
+    whole_seconds, milliseconds = divmod(timestamp_ms, 1000)
+    return datetime.fromtimestamp(
+        whole_seconds, tz=timezone.utc
+    ).replace(microsecond=milliseconds * 1000)
+
+
 def in_scan_window(timestamp_ms):
-    local_time = datetime.fromtimestamp(
-        timestamp_ms / 1000, tz=timezone.utc
-    ).astimezone(IST).time()
+    local_time = datetime_from_ms(timestamp_ms).astimezone(IST).time()
     return SCAN_START_IST <= local_time < SCAN_END_IST
 
 
 def ist_date_for(timestamp_ms):
-    return datetime.fromtimestamp(
-        timestamp_ms / 1000, tz=timezone.utc
-    ).astimezone(IST).date().isoformat()
+    return datetime_from_ms(timestamp_ms).astimezone(IST).date().isoformat()
 
 
 def signal_key(symbol, signal_time_ms):
@@ -606,12 +611,8 @@ def fmt_decimal(value, places=3):
 def format_alert(symbol, features, signal_time_ms):
     signal_time_ms = as_integer(signal_time_ms, "alert signal timestamp")
     window_start_ms = as_integer(features["window_start_ms"], "alert window start")
-    signal_time = datetime.fromtimestamp(
-        signal_time_ms / 1000, tz=timezone.utc
-    ).astimezone(IST)
-    start_time = datetime.fromtimestamp(
-        window_start_ms / 1000, tz=timezone.utc
-    ).astimezone(IST)
+    signal_time = datetime_from_ms(signal_time_ms).astimezone(IST)
+    start_time = datetime_from_ms(window_start_ms).astimezone(IST)
     return (
         "🟡 <b>PRE-PUMP FILTER MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
@@ -818,9 +819,7 @@ def run_scan():
     now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
 
     if not in_scan_window(now_ms):
-        local_now = datetime.fromtimestamp(
-            now_ms / 1000, tz=timezone.utc
-        ).astimezone(IST)
+        local_now = datetime_from_ms(now_ms).astimezone(IST)
         log.info(
             "Outside the research scan window (%s–%s IST); no market scan or alerts",
             SCAN_START_IST.strftime("%H:%M"),
@@ -869,7 +868,7 @@ def run_scan():
     current_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
     previous_seen = state["seen"]
     previous_pending = state["pending"]
-    state["seen"] = prune_seen(previous_seen)
+    state["seen"] = prune_seen(previous_seen, now_seconds=current_now_ms / 1000.0)
     state["pending"] = prune_pending(previous_pending, current_now_ms)
     changed = state["seen"] != previous_seen or state["pending"] != previous_pending
 
@@ -901,7 +900,8 @@ def run_scan():
             continue
 
         if telegram(format_alert(symbol, features, signal_time_ms)):
-            state["seen"][key] = time.time()
+            sent_at_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
+            state["seen"][key] = sent_at_ms / 1000.0
             del state["pending"][key]
             sent_count += 1
             changed = True
