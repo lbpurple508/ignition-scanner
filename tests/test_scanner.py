@@ -238,11 +238,15 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
 
 
 class ScheduleAndStateTests(unittest.TestCase):
-    def test_research_window_is_0530_to_0830_ist(self):
-        inside = int(datetime(2026, 11, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        outside = int(datetime(2026, 11, 5, 3, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        self.assertTrue(scanner.in_scan_window(inside))
-        self.assertFalse(scanner.in_scan_window(outside))
+    def test_research_window_is_0530_to_1800_ist(self):
+        before_start = int(datetime(2026, 11, 4, 23, 59, tzinfo=timezone.utc).timestamp() * 1000)
+        start = int(datetime(2026, 11, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        before_end = int(datetime(2026, 11, 5, 12, 29, tzinfo=timezone.utc).timestamp() * 1000)
+        end = int(datetime(2026, 11, 5, 12, 30, tzinfo=timezone.utc).timestamp() * 1000)
+        self.assertFalse(scanner.in_scan_window(before_start))
+        self.assertTrue(scanner.in_scan_window(start))
+        self.assertTrue(scanner.in_scan_window(before_end))
+        self.assertFalse(scanner.in_scan_window(end))
 
     def test_once_per_symbol_per_ist_day(self):
         stamp = int(datetime(2026, 11, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000)
