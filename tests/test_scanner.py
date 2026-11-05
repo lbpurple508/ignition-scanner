@@ -184,6 +184,13 @@ class FilterThresholdTests(unittest.TestCase):
     def test_inconsistent_window_duration_fails_closed(self):
         self.assertFalse(scanner.passes_pump_filter(make_features(window_end_ms=1)))
 
+    def test_missing_alert_fields_fail_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(last_close=None)))
+        self.assertFalse(scanner.passes_pump_filter(make_features(prior_24h_quote_per_minute="0")))
+
+    def test_overflowing_counts_fail_closed(self):
+        self.assertFalse(scanner.passes_pump_filter(make_features(g4h_count=float("inf"))))
+
 
 class UniverseTests(unittest.TestCase):
     def test_stablecoin_and_stock_assets_are_excluded(self):
@@ -226,6 +233,20 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
         self.assertEqual(baseline, Decimal("100"))
         self.assertEqual(get.call_args.args[1]["endTime"], start - 1)
         self.assertEqual(get.call_args.args[1]["limit"], scanner.FETCH_1H_LIMIT)
+
+    def test_duplicate_hourly_candle_makes_baseline_unusable(self):
+        start = 25 * scanner.ONE_HOUR_MS
+        rows = []
+        for index in range(24):
+            open_ms = (index + 1) * scanner.ONE_HOUR_MS
+            rows.append([
+                open_ms, "100", "101", "99", "100", "10",
+                open_ms + scanner.ONE_HOUR_MS - 1, "6000",
+                100, "5", "30000", "0",
+            ])
+        rows.append(rows[-1])
+        with patch.object(scanner, "get_json", return_value=rows):
+            self.assertIsNone(scanner.fetch_prior_24h_quote_baseline("BTCUSDT", start))
 
     def test_incomplete_hourly_baseline_is_skipped(self):
         with patch.object(scanner, "get_json", return_value=[]):
@@ -303,6 +324,12 @@ class ScheduleAndStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scanner.deserialize_candidate(candidate)
 
+    def test_pending_candidate_rejects_overflow_timestamp(self):
+        candidate = scanner.serialize_candidate("BTCUSDT", make_features())
+        candidate["signal_time_ms"] = float("inf")
+        with self.assertRaises(ValueError):
+            scanner.deserialize_candidate(candidate)
+
     def test_old_pending_candidate_expires(self):
         old_time = 1_000_000
         features = make_features(
@@ -315,6 +342,21 @@ class ScheduleAndStateTests(unittest.TestCase):
             scanner.prune_pending({key: record}, old_time + scanner.PENDING_TTL_MS + 1),
             {},
         )
+
+    def test_seen_state_pruning_ignores_malformed_entries(self):
+        now = 2_000_000
+        valid_key = "BTCUSDT|1970-01-01"
+        malformed = {
+            valid_key: now,
+            "BTCUSDT|not-a-date": now,
+            "BTC/USDT|1970-01-01": now,
+            "UUSDT|1970-01-01": now,
+            "BTCUSDT|1970-01-01|extra": now,
+            "BTCUSDT|1970-01-01": 10 ** 10000,
+            "ETHUSDT|1970-01-01": float("nan"),
+        }
+        cleaned = scanner.prune_seen(malformed, now_seconds=now)
+        self.assertEqual(cleaned, {valid_key: now})
 
 
 if __name__ == "__main__":
