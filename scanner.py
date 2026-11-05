@@ -139,10 +139,12 @@ def get_json(path, params=None):
 
 
 def as_integer(value, name):
-    """Parse an exact integer without silently truncating fractional input."""
+    """Parse a supported epoch-millisecond integer without truncation or huge casts."""
     number = as_decimal(value, name)
     if number != number.to_integral_value():
         raise ValueError(f"Non-integer {name}")
+    if number < 0 or number > MAX_TIMESTAMP_MS:
+        raise ValueError(f"Out-of-range {name}")
     return int(number)
 
 
@@ -275,6 +277,8 @@ def parse_kline(row, interval_ms):
         raise ValueError("Inconsistent low price")
     if min(base_volume, quote_volume, taker_buy_base) < 0:
         raise ValueError("Negative volume")
+    if (base_volume == 0) != (quote_volume == 0):
+        raise ValueError("Base and quote volumes disagree on zero trades")
     if taker_buy_base > base_volume:
         raise ValueError("Taker-buy base volume exceeds total base volume")
 
@@ -466,6 +470,14 @@ def passes_pump_filter(features):
     """Pass only when every stated research threshold is satisfied."""
     if not isinstance(features, dict):
         return False
+    if any(
+        type(features.get(field)) is not int
+        for field in (
+            "window_start_ms", "window_end_ms", "g4h_count",
+            "valid_candles", "invalid_candles",
+        )
+    ):
+        return False
     try:
         vol_peak = as_decimal(features["vol_peak_ratio"], "vol_peak_ratio")
         volume_acceleration = as_decimal(features["volume_acceleration"], "volume_acceleration")
@@ -592,11 +604,13 @@ def fmt_decimal(value, places=3):
 
 
 def format_alert(symbol, features, signal_time_ms):
+    signal_time_ms = as_integer(signal_time_ms, "alert signal timestamp")
+    window_start_ms = as_integer(features["window_start_ms"], "alert window start")
     signal_time = datetime.fromtimestamp(
         signal_time_ms / 1000, tz=timezone.utc
     ).astimezone(IST)
     start_time = datetime.fromtimestamp(
-        features["window_start_ms"] / 1000, tz=timezone.utc
+        window_start_ms / 1000, tz=timezone.utc
     ).astimezone(IST)
     return (
         "🟡 <b>PRE-PUMP FILTER MATCH</b>\n\n"
@@ -674,7 +688,7 @@ def load_state():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return initial_state()
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "Scanner state is unreadable/corrupt; refusing to send until repaired"
         ) from exc
@@ -726,19 +740,9 @@ def deserialize_candidate(record):
     if not passes_pump_filter(features):
         raise ValueError("Pending candidate no longer satisfies the pre-pump filter")
     raw_signal_time = record["signal_time_ms"]
-    try:
-        signal_time_ms = int(raw_signal_time)
-        exact_signal_time = Decimal(str(raw_signal_time))
-    except (TypeError, ValueError, InvalidOperation, OverflowError) as exc:
-        raise ValueError("Pending signal timestamp is invalid") from exc
-    if (
-        isinstance(raw_signal_time, bool)
-        or not exact_signal_time.is_finite()
-        or exact_signal_time != Decimal(signal_time_ms)
-        or signal_time_ms < 0
-        or signal_time_ms > MAX_TIMESTAMP_MS
-    ):
+    if type(raw_signal_time) is not int or not (0 <= raw_signal_time <= MAX_TIMESTAMP_MS):
         raise ValueError("Pending signal timestamp is not a supported integer")
+    signal_time_ms = raw_signal_time
     if signal_time_ms != int(features["window_end_ms"]):
         raise ValueError("Pending signal timestamp does not match feature window")
     if not in_scan_window(signal_time_ms):
