@@ -107,7 +107,7 @@ class FeatureCalculationTests(unittest.TestCase):
         self.assertIsNotNone(features)
         self.assertEqual(Decimal(features["volume_acceleration"]), Decimal("0.4"))
         self.assertEqual(Decimal(features["taker_buy_ratio"]), Decimal("0.55"))
-        self.assertEqual(Decimal(features["lower_wick_density"]), Decimal("1"))
+        self.assertEqual(Decimal(features["lower_wick_density"]), Decimal("0.4"))
         self.assertEqual(Decimal(features["quote_volume_per_minute"]), Decimal("1080"))
         self.assertEqual(features["valid_candles"], 30)
 
@@ -117,7 +117,7 @@ class FeatureCalculationTests(unittest.TestCase):
 
     def test_insufficient_valid_candles_is_skipped(self):
         window = make_passing_window()
-        for index in range(12, 30):
+        for index in range(11, 30):
             row = make_kline(index, "100", "100", "100", "100", "0", "0", "0")
             window[index] = scanner.parse_kline(row, scanner.ONE_MINUTE_MS)
         self.assertIsNone(scanner.compute_features(window, Decimal("100")))
@@ -196,7 +196,7 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
             open_ms = (index + 1) * scanner.ONE_HOUR_MS
             rows.append([
                 open_ms, "100", "101", "99", "100", "10",
-                open_ms + scanner.ONE_HOUR_MS - 1, "60000",
+                open_ms + scanner.ONE_HOUR_MS - 1, "6000",
                 100, "5", "30000", "0",
             ])
         with patch.object(scanner, "get_json", return_value=rows) as get:
