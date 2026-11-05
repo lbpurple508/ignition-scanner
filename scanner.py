@@ -138,10 +138,20 @@ def get_json(path, params=None):
     return response.json()
 
 
+def as_integer(value, name):
+    """Parse an exact integer without silently truncating fractional input."""
+    number = as_decimal(value, name)
+    if number != number.to_integral_value():
+        raise ValueError(f"Non-integer {name}")
+    return int(number)
+
+
 def fetch_server_time_ms():
     payload = get_json("/api/v3/time")
-    server_time_ms = int(payload["serverTime"])
-    if server_time_ms <= 0:
+    if not isinstance(payload, dict) or "serverTime" not in payload:
+        raise RuntimeError("Binance returned an invalid server-time payload")
+    server_time_ms = as_integer(payload["serverTime"], "server time")
+    if not (0 < server_time_ms <= MAX_TIMESTAMP_MS):
         raise RuntimeError("Binance returned an invalid server time")
     return server_time_ms
 
@@ -237,9 +247,9 @@ def parse_kline(row, interval_ms):
         raise ValueError("Malformed Binance kline row")
 
     try:
-        open_time_ms = int(row[0])
-        close_time_ms = int(row[6])
-    except (TypeError, ValueError) as exc:
+        open_time_ms = as_integer(row[0], "kline open timestamp")
+        close_time_ms = as_integer(row[6], "kline close timestamp")
+    except (TypeError, ValueError, InvalidOperation, OverflowError) as exc:
         raise ValueError("Invalid kline timestamps") from exc
 
     if (
@@ -306,8 +316,8 @@ def fetch_completed_1m_window(symbol, server_time_ms, server_time_monotonic):
         if not isinstance(row, (list, tuple)) or len(row) < 11:
             raise ValueError(f"Malformed 1m kline row for {symbol}")
         try:
-            close_ms = int(row[6])
-        except (TypeError, ValueError, IndexError) as exc:
+            close_ms = as_integer(row[6], "1m close timestamp")
+        except (TypeError, ValueError, IndexError, InvalidOperation, OverflowError) as exc:
             raise ValueError(f"Invalid 1m close time for {symbol}") from exc
         if close_ms >= now_ms:
             continue
@@ -351,9 +361,9 @@ def fetch_prior_24h_quote_baseline(symbol, window_start_ms):
         if not isinstance(row, (list, tuple)) or len(row) < 8:
             raise ValueError(f"Malformed 1h baseline row for {symbol}")
         try:
-            open_ms = int(row[0])
-            close_ms = int(row[6])
-        except (TypeError, ValueError, IndexError) as exc:
+            open_ms = as_integer(row[0], "1h open timestamp")
+            close_ms = as_integer(row[6], "1h close timestamp")
+        except (TypeError, ValueError, IndexError, InvalidOperation, OverflowError) as exc:
             raise ValueError(f"Invalid 1h baseline timestamp for {symbol}") from exc
         if close_ms >= window_start_ms:
             continue
