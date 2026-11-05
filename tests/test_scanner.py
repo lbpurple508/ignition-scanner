@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import scanner
 
@@ -324,6 +324,56 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
         with patch.object(scanner, "get_json", return_value=rows):
             with patch.object(scanner.time, "monotonic", return_value=10.0):
                 self.assertIsNone(scanner.fetch_completed_1m_window("BTCUSDT", now, 10.0))
+
+
+class AlertAndTelegramTests(unittest.TestCase):
+    def test_alert_displays_exclusive_end_of_30m_window(self):
+        features = make_features()
+        message = scanner.format_alert(
+            "BTCUSDT", features, features["window_end_ms"]
+        )
+        self.assertIn("30m window:</b> 05:30–06:00 IST", message)
+
+    def test_telegram_defers_when_retry_after_exceeds_budget(self):
+        response = Mock()
+        response.status_code = 429
+        response.json.return_value = {
+            "ok": False,
+            "parameters": {"retry_after": 60},
+        }
+        session = Mock()
+        session.post.return_value = response
+        with (
+            patch.object(scanner, "TELEGRAM_TOKEN", "test-token"),
+            patch.object(scanner, "TELEGRAM_CHAT_ID", "test-chat"),
+            patch.object(scanner, "_session", return_value=session),
+            patch.object(scanner.time, "sleep") as sleep,
+        ):
+            self.assertFalse(scanner.telegram("test"))
+        self.assertEqual(session.post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_telegram_waits_exact_short_retry_after_then_retries(self):
+        limited = Mock()
+        limited.status_code = 429
+        limited.json.return_value = {
+            "ok": False,
+            "parameters": {"retry_after": 3},
+        }
+        delivered = Mock()
+        delivered.status_code = 200
+        delivered.json.return_value = {"ok": True}
+        session = Mock()
+        session.post.side_effect = [limited, delivered]
+        with (
+            patch.object(scanner, "TELEGRAM_TOKEN", "test-token"),
+            patch.object(scanner, "TELEGRAM_CHAT_ID", "test-chat"),
+            patch.object(scanner, "_session", return_value=session),
+            patch.object(scanner.time, "sleep") as sleep,
+        ):
+            self.assertTrue(scanner.telegram("test"))
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once_with(3)
 
 
 class ScheduleAndStateTests(unittest.TestCase):
