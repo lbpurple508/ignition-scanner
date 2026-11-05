@@ -730,9 +730,6 @@ def scanner_lock():
 
 
 def run_scan():
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
-
     server_time_ms = fetch_server_time_ms()
     server_time_monotonic = time.monotonic()
     now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
@@ -748,6 +745,9 @@ def run_scan():
         )
         log.info("Current time: %s IST", local_now.strftime("%Y-%m-%d %H:%M:%S"))
         return
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
 
     state = load_state()
     symbols = fetch_universe()
@@ -847,8 +847,6 @@ def run_scan():
 
 
 def main():
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
     with scanner_lock() as acquired:
         if not acquired:
             log.warning("Another scanner process is active; exiting")
