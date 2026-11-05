@@ -88,6 +88,17 @@ class KlineParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scanner.parse_kline(row, scanner.ONE_MINUTE_MS)
 
+    def test_rejects_fractional_exchange_timestamps(self):
+        fractional_open = make_kline(1)
+        fractional_open[0] = str(Decimal(fractional_open[0]) + Decimal("0.5"))
+        with self.assertRaises(ValueError):
+            scanner.parse_kline(fractional_open, scanner.ONE_MINUTE_MS)
+
+        fractional_close = make_kline(1)
+        fractional_close[6] = str(Decimal(fractional_close[6]) + Decimal("0.5"))
+        with self.assertRaises(ValueError):
+            scanner.parse_kline(fractional_close, scanner.ONE_MINUTE_MS)
+
     def test_rejects_inconsistent_ohlc(self):
         with self.assertRaises(ValueError):
             scanner.parse_kline(make_kline(0, "100", "99", "98", "100"),
@@ -218,6 +229,11 @@ class UniverseTests(unittest.TestCase):
 
 
 class BaselineAndWindowFetchTests(unittest.TestCase):
+    def test_server_time_rejects_fractional_timestamp(self):
+        with patch.object(scanner, "get_json", return_value={"serverTime": "1700000000000.5"}):
+            with self.assertRaises(ValueError):
+                scanner.fetch_server_time_ms()
+
     def test_baseline_uses_24_closed_hours_before_window(self):
         start = 25 * scanner.ONE_HOUR_MS
         rows = []
