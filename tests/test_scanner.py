@@ -132,6 +132,14 @@ class FeatureCalculationTests(unittest.TestCase):
 
 
 class FilterThresholdTests(unittest.TestCase):
+    def test_g4h0_prefix_is_counted_even_without_a_wick(self):
+        window = make_passing_window()
+        row = make_kline(12, "100", "103", "100", "103", "100", "5000", "55")
+        window[12] = scanner.parse_kline(row, scanner.ONE_MINUTE_MS)
+        features = scanner.compute_features(window, Decimal("100"))
+        self.assertEqual(features["g4h_count"], 1)
+        self.assertFalse(scanner.passes_pump_filter(features))
+
     def test_all_thresholds_pass(self):
         self.assertTrue(scanner.passes_pump_filter(make_features()))
 

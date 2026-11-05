@@ -363,7 +363,7 @@ def compute_features(window, prior_24h_quote_per_minute):
     - VolAccel = last 5m average quote volume / preceding 25m average quote volume.
     - TakerBuy = total taker-buy base volume / total base volume across 30m.
     - Lower-wick density = L-only candles / valid (non-zero-range) candles.
-    - G4H = green, >75%-body, >2x-30m-average-volume candle with an upper wick.
+    - G4H = green, >75%-body, >2x-30m-average-volume candle (wick suffix is ignored).
     """
     if not isinstance(window, list) or len(window) != WINDOW_CANDLES:
         return None
@@ -408,7 +408,6 @@ def compute_features(window, prior_24h_quote_per_minute):
             bar["close"] > bar["open"]
             and bar["body_ratio"] > Decimal("0.75")
             and bar["quote_volume"] > Decimal("2") * quote_per_minute
-            and bar["upper_wick"] > 0
         )
     )
 
