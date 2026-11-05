@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Scan Binance Spot USDT pairs for the user's exact 15-minute T candle."""
+"""Live Binance Spot USDT pre-pump candidate scanner based on the supplied Nov 5 study.
+
+This is a research filter, not a trading system. It emits candidates only.
+"""
 
 import fcntl
 import html
@@ -11,7 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, time as clock_time, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,20 +27,39 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 BINANCE = "https://data-api.binance.vision"
-INTERVAL = "15m"
-INTERVAL_MS = 15 * 60 * 1000
+ONE_MINUTE_MS = 60_000
+ONE_HOUR_MS = 60 * ONE_MINUTE_MS
+WINDOW_CANDLES = 30
+BASELINE_HOURS = 24
+FETCH_1M_LIMIT = WINDOW_CANDLES + 1
+FETCH_1H_LIMIT = BASELINE_HOURS + 2
+MIN_VALID_CANDLES = 12
 MAX_WORKERS = 12
-REQUESTS_PER_SECOND = 8  # Binance kline request weight is 2: about 960 weight/minute.
+REQUESTS_PER_SECOND = 8
+PENDING_TTL_MS = 30 * 60 * 1000
+SEEN_TTL_SECONDS = 7 * 24 * 60 * 60
+STATE_VERSION = 2
+
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / ".scanner_state"
 STATE_FILE = STATE_DIR / "seen_signals.json"
 LOCK_FILE = STATE_DIR / "scanner.lock"
-SEEN_TTL_SEC = 24 * 60 * 60
-IST = ZoneInfo("Asia/Kolkata")
 
-# Binance bStocks/tokenized-security base assets, compiled from Binance Spot listings.
-# This is deliberately an explicit list; do NOT exclude every ticker ending in "B",
-# because ordinary crypto assets such as BNB also end in B.
+IST = ZoneInfo("Asia/Kolkata")
+SCAN_START_IST = clock_time(5, 30)
+SCAN_END_IST = clock_time(8, 30)
+
+# Thresholds from the user's Nov 5, 2026 research handoff.
+MAX_VOL_PEAK_RATIO = Decimal("100")
+MAX_VOLUME_ACCELERATION = Decimal("0.50")
+MIN_TAKER_BUY_RATIO = Decimal("0.50")  # strict lower bound
+MAX_TAKER_BUY_RATIO = Decimal("0.62")  # strict upper bound
+MIN_LOWER_WICK_DENSITY = Decimal("0.35")
+REQUIRED_G4H_COUNT = 0
+MIN_QUOTE_VOLUME_PER_MINUTE = Decimal("1000")
+
+# Tokenized equities / securities listed on Binance Spot.
+# Explicit list: do not blanket-exclude every ticker ending in B (e.g. BNB).
 STOCK_LINKED_ASSETS = frozenset({
     "AAPLB", "AAOIB", "ADBEB", "ALABB", "AMATB", "AMCB", "AMDB", "AMZNB",
     "APPB", "ARMB", "ASMLB", "ASTSB", "AVGOB", "BABAB", "BBB", "BEB",
@@ -52,8 +74,8 @@ STOCK_LINKED_ASSETS = frozenset({
     "UVXYB", "VSTB", "WDCB", "WENB", "ZMB", "SKDDB", "SKUUB",
 })
 
-# Fiat-pegged or stable-index base assets to exclude from USDT-quoted scanning.
-# USDT is intentionally NOT listed: it remains the quote asset for eligible pairs.
+# Stablecoin / fiat-pegged base assets to exclude. USDT is intentionally absent:
+# it remains the quote asset for normal crypto pairs.
 STABLECOIN_ASSETS = frozenset({
     "AEUR", "AUSD", "BIDR", "BFUSD", "BUSD", "CRVUSD", "DAI", "EURI",
     "EURC", "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT",
@@ -62,7 +84,6 @@ STABLECOIN_ASSETS = frozenset({
     "USDG", "USDP", "USDQ", "USDS", "USDTB", "USDX", "USDY", "USDC",
     "XUSD",
 })
-PENDING_TTL_MS = 30 * 60 * 1000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ignition-scanner")
@@ -72,7 +93,7 @@ _next_request_at = 0.0
 
 
 def _pace_request():
-    """Keep aggregate Binance request weight comfortably below the public limit."""
+    """Pace aggregate public Binance requests across all scanner threads."""
     global _next_request_at
     with _request_lock:
         now = time.monotonic()
@@ -83,7 +104,7 @@ def _pace_request():
 
 
 def _session():
-    """Give each worker its own HTTP session with bounded GET retries."""
+    """Create a retrying HTTP session per worker thread."""
     session = getattr(_thread_local, "session", None)
     if session is None:
         retry = Retry(
@@ -104,7 +125,7 @@ def _session():
         session = requests.Session()
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        session.headers.update({"User-Agent": "ignition-scanner/2.1"})
+        session.headers.update({"User-Agent": "ignition-scanner/4.0"})
         _thread_local.session = session
     return session
 
@@ -118,50 +139,36 @@ def get_json(path, params=None):
 
 def fetch_server_time_ms():
     payload = get_json("/api/v3/time")
-    server_time = int(payload["serverTime"])
-    if server_time <= 0:
+    server_time_ms = int(payload["serverTime"])
+    if server_time_ms <= 0:
         raise RuntimeError("Binance returned an invalid server time")
-    return server_time
+    return server_time_ms
 
 
 def effective_server_time_ms(server_time_ms, server_time_monotonic):
-    """Advance the Binance server-time snapshot by elapsed monotonic time."""
     elapsed_ms = max(0, int((time.monotonic() - server_time_monotonic) * 1000))
     return server_time_ms + elapsed_ms
 
 
-def is_stock_linked_symbol(symbol):
-    """Return True for Binance-listed tokenized stock/security base assets."""
-    base_asset = symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
-    return base_asset in STOCK_LINKED_ASSETS
-
-
-def is_stablecoin_asset(base_asset):
-    """Return True for known fiat-pegged base assets; USDT is deliberately allowed as quote."""
-    return isinstance(base_asset, str) and base_asset in STABLECOIN_ASSETS and base_asset != "USDT"
-
-
-def is_stablecoin_symbol(symbol):
-    """Return True when a USDT pair's base asset is a known stablecoin."""
-    base_asset = symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
-    return is_stablecoin_asset(base_asset)
+def base_asset_from_symbol(symbol):
+    return symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
 
 
 def is_excluded_symbol(symbol):
-    """Return True for tokenized stocks or stablecoin base assets."""
-    return is_stock_linked_symbol(symbol) or is_stablecoin_symbol(symbol)
+    base_asset = base_asset_from_symbol(symbol)
+    return base_asset in STOCK_LINKED_ASSETS or base_asset in STABLECOIN_ASSETS
 
 
 def fetch_universe():
-    """Return active Binance Spot USDT crypto pairs, excluding bStocks and stablecoin bases."""
-    exchange_info = get_json("/api/v3/exchangeInfo")
-    entries = exchange_info.get("symbols") if isinstance(exchange_info, dict) else None
+    """Fetch current active Binance Spot USDT pairs, excluding stocks and stablecoins."""
+    payload = get_json("/api/v3/exchangeInfo")
+    entries = payload.get("symbols") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
-        raise RuntimeError("Binance returned an invalid exchange-info response")
+        raise RuntimeError("Binance returned invalid exchange-info data")
 
     symbols = []
-    excluded_stock_pairs = 0
-    excluded_stablecoin_pairs = 0
+    excluded_stocks = 0
+    excluded_stablecoins = 0
     for item in entries:
         if not isinstance(item, dict):
             continue
@@ -172,146 +179,336 @@ def fetch_universe():
 
         symbol = item.get("symbol")
         base_asset = item.get("baseAsset")
-        if not isinstance(base_asset, str) and isinstance(symbol, str) and symbol.endswith("USDT"):
-            base_asset = symbol[:-4]
+        if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+            continue
+        if not isinstance(base_asset, str):
+            base_asset = base_asset_from_symbol(symbol)
+
         if base_asset in STOCK_LINKED_ASSETS:
-            excluded_stock_pairs += 1
+            excluded_stocks += 1
             continue
-        if is_stablecoin_asset(base_asset):
-            excluded_stablecoin_pairs += 1
+        if base_asset in STABLECOIN_ASSETS:
+            excluded_stablecoins += 1
             continue
-        if isinstance(symbol, str) and symbol:
-            symbols.append(symbol)
+        symbols.append(symbol)
 
-    log.info("Excluded %s tokenized stock/security USDT pairs", excluded_stock_pairs)
-    log.info("Excluded %s stablecoin-base USDT pairs (USDT quote retained)", excluded_stablecoin_pairs)
+    symbols = sorted(set(symbols))
+    log.info(
+        "Eligible USDT Spot pairs: %s; excluded %s tokenized securities and %s stablecoin bases",
+        len(symbols), excluded_stocks, excluded_stablecoins,
+    )
     if not symbols:
-        raise RuntimeError("Binance returned no eligible active crypto USDT Spot pairs")
-    return sorted(set(symbols))
+        raise RuntimeError("Binance returned no eligible USDT Spot crypto pairs")
+    return symbols
 
 
-def exact_t_candle(kline):
-    """Match ONLY Body 0%, Upper Wick 0%, Lower Wick 100%.
-
-    Exactly equivalent to Open == High == Close and Low < High.
-    Decimal avoids approximate floating-point comparisons.
-    """
+def as_decimal(value, name):
     try:
-        open_price = Decimal(str(kline[1]))
-        high_price = Decimal(str(kline[2]))
-        low_price = Decimal(str(kline[3]))
-        close_price = Decimal(str(kline[4]))
-        open_time_ms = int(kline[0])
-        close_time_ms = int(kline[6])
-    except (IndexError, TypeError, ValueError, InvalidOperation):
-        return None
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {name}") from exc
+    if not number.is_finite():
+        raise ValueError(f"Non-finite {name}")
+    return number
 
-    prices = (open_price, high_price, low_price, close_price)
-    if not all(price.is_finite() for price in prices):
-        return None
+
+def parse_kline(row, interval_ms):
+    """Parse Binance kline fields and calculate candle morphology from real OHLC."""
+    if not isinstance(row, (list, tuple)) or len(row) < 11:
+        raise ValueError("Malformed Binance kline row")
+
+    try:
+        open_time_ms = int(row[0])
+        close_time_ms = int(row[6])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid kline timestamps") from exc
+
     if (
         open_time_ms < 0
-        or open_time_ms % INTERVAL_MS != 0
-        or close_time_ms != open_time_ms + INTERVAL_MS - 1
+        or open_time_ms % interval_ms != 0
+        or close_time_ms != open_time_ms + interval_ms - 1
     ):
-        return None
-    if not (open_price == high_price == close_price and low_price < high_price):
-        return None
+        raise ValueError("Misaligned kline timestamps")
+
+    open_price = as_decimal(row[1], "open")
+    high_price = as_decimal(row[2], "high")
+    low_price = as_decimal(row[3], "low")
+    close_price = as_decimal(row[4], "close")
+    base_volume = as_decimal(row[5], "base volume")
+    quote_volume = as_decimal(row[7], "quote volume")
+    taker_buy_base = as_decimal(row[9], "taker-buy base volume")
+
+    if min(open_price, high_price, low_price, close_price) <= 0:
+        raise ValueError("Non-positive OHLC price")
+    if high_price < max(open_price, close_price, low_price):
+        raise ValueError("Inconsistent high price")
+    if low_price > min(open_price, close_price, high_price):
+        raise ValueError("Inconsistent low price")
+    if min(base_volume, quote_volume, taker_buy_base) < 0:
+        raise ValueError("Negative volume")
+    if taker_buy_base > base_volume:
+        raise ValueError("Taker-buy base volume exceeds total base volume")
+
+    upper_wick = high_price - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low_price
+    candle_range = high_price - low_price
+    valid = candle_range > 0
+    body_ratio = abs(close_price - open_price) / candle_range if valid else Decimal("0")
 
     return {
+        "open_time_ms": open_time_ms,
+        "close_time_ms": close_time_ms,
         "open": open_price,
         "high": high_price,
         "low": low_price,
         "close": close_price,
-        "open_time_ms": open_time_ms,
-        "close_time_ms": close_time_ms,
-        "body_pct": Decimal("0"),
-        "upper_wick_pct": Decimal("0"),
-        "lower_wick_pct": Decimal("100"),
+        "base_volume": base_volume,
+        "quote_volume": quote_volume,
+        "taker_buy_base": taker_buy_base,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "body_ratio": body_ratio,
+        "valid": valid,
     }
 
 
-def fetch_new_closed_klines(
-    symbol, server_time_ms, server_time_monotonic, last_processed_open_time_ms=None
-):
-    """Fetch only unseen, fully closed candles for this symbol.
+def fetch_completed_1m_window(symbol, server_time_ms, server_time_monotonic):
+    """Fetch exactly the latest 30 completed, continuous 1-minute bars."""
+    rows = get_json(
+        "/api/v3/klines",
+        {"symbol": symbol, "interval": "1m", "limit": FETCH_1M_LIMIT},
+    )
+    if not isinstance(rows, list):
+        raise ValueError(f"Malformed 1m kline response for {symbol}")
 
-    First-ever run: inspect just the latest completed candle and save it as T1
-    (if it matches). Later runs: resume strictly after the saved candle cursor.
-    """
-    if last_processed_open_time_ms is None:
-        params = {"symbol": symbol, "interval": INTERVAL, "limit": 2}
-    else:
-        params = {
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "startTime": int(last_processed_open_time_ms) + INTERVAL_MS,
-            "limit": 1000,
-        }
-
-    klines = get_json("/api/v3/klines", params)
-    if not isinstance(klines, list):
-        raise ValueError(f"Binance returned a malformed kline response for {symbol}")
-
-    effective_time_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
-    closed_by_open_time = {}
-    for kline in klines:
+    now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
+    completed = {}
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 11:
+            raise ValueError(f"Malformed 1m kline row for {symbol}")
         try:
-            open_time_ms = int(kline[0])
-            close_time_ms = int(kline[6])
-        except (IndexError, TypeError, ValueError):
+            close_ms = int(row[6])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError(f"Invalid 1m close time for {symbol}") from exc
+        if close_ms >= now_ms:
             continue
+        bar = parse_kline(row, ONE_MINUTE_MS)
+        completed[bar["open_time_ms"]] = bar
 
-        if close_time_ms >= effective_time_ms:
+    bars = [completed[key] for key in sorted(completed)]
+    if len(bars) < WINDOW_CANDLES:
+        return None
+    window = bars[-WINDOW_CANDLES:]
+    for previous, current in zip(window, window[1:]):
+        if current["open_time_ms"] - previous["open_time_ms"] != ONE_MINUTE_MS:
+            return None
+    return window
+
+
+def fetch_prior_24h_quote_baseline(symbol, window_start_ms):
+    """Average quote volume/minute over 24 completed hourly candles before the scan window.
+
+    The report does not define its VolPeak baseline. We use the prior 24 complete
+    hours (ending before this 30m window) so max 1m volume / baseline can exceed
+    100 and the stated threshold is meaningful.
+    """
+    rows = get_json(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": "1h",
+            "endTime": int(window_start_ms) - 1,
+            "limit": FETCH_1H_LIMIT,
+        },
+    )
+    if not isinstance(rows, list):
+        raise ValueError(f"Malformed 1h baseline response for {symbol}")
+
+    completed = {}
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 8:
+            raise ValueError(f"Malformed 1h baseline row for {symbol}")
+        try:
+            open_ms = int(row[0])
+            close_ms = int(row[6])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError(f"Invalid 1h baseline timestamp for {symbol}") from exc
+        if close_ms >= window_start_ms:
             continue
-        if open_time_ms < 0 or open_time_ms % INTERVAL_MS != 0:
-            continue
-        if close_time_ms != open_time_ms + INTERVAL_MS - 1:
-            continue
+        if open_ms < 0 or open_ms % ONE_HOUR_MS != 0:
+            raise ValueError(f"Misaligned 1h baseline timestamp for {symbol}")
+        if close_ms != open_ms + ONE_HOUR_MS - 1:
+            raise ValueError(f"Invalid 1h baseline close time for {symbol}")
+        quote_volume = as_decimal(row[7], "1h quote volume")
+        if quote_volume < 0:
+            raise ValueError("Negative 1h quote volume")
+        completed[open_ms] = quote_volume
+
+    hours = sorted(completed.items())[-BASELINE_HOURS:]
+    if len(hours) != BASELINE_HOURS:
+        return None
+    for (previous_ms, _), (current_ms, _) in zip(hours, hours[1:]):
+        if current_ms - previous_ms != ONE_HOUR_MS:
+            return None
+
+    total_quote_volume = sum((volume for _, volume in hours), Decimal("0"))
+    baseline_per_minute = total_quote_volume / Decimal(BASELINE_HOURS * 60)
+    return baseline_per_minute if baseline_per_minute > 0 else None
+
+
+def compute_features(window, prior_24h_quote_per_minute):
+    """Calculate the report's metrics plus the minimum liquidity floor.
+
+    - VolPeak = max 1m USDT quote volume / prior-24h average USDT volume per minute.
+    - VolAccel = last 5m average quote volume / preceding 25m average quote volume.
+    - TakerBuy = total taker-buy base volume / total base volume across 30m.
+    - Lower-wick density = L-only candles / valid (non-zero-range) candles.
+    - G4H = green, >75%-body, >2x-30m-average-volume candle with an upper wick.
+    """
+    if not isinstance(window, list) or len(window) != WINDOW_CANDLES:
+        return None
+    baseline = as_decimal(prior_24h_quote_per_minute, "prior-24h quote volume baseline")
+    if baseline <= 0:
+        return None
+
+    bars = sorted(window, key=lambda item: item["open_time_ms"])
+    for previous, current in zip(bars, bars[1:]):
+        if current["open_time_ms"] - previous["open_time_ms"] != ONE_MINUTE_MS:
+            return None
+
+    valid = [bar for bar in bars if bar["valid"]]
+    if len(valid) < MIN_VALID_CANDLES:
+        return None
+
+    quote_total = sum((bar["quote_volume"] for bar in bars), Decimal("0"))
+    base_total = sum((bar["base_volume"] for bar in bars), Decimal("0"))
+    taker_buy_total = sum((bar["taker_buy_base"] for bar in bars), Decimal("0"))
+    if quote_total <= 0 or base_total <= 0:
+        return None
+
+    quote_per_minute = quote_total / Decimal(WINDOW_CANDLES)
+    prior_25_average = sum((bar["quote_volume"] for bar in bars[:25]), Decimal("0")) / Decimal("25")
+    last_5_average = sum((bar["quote_volume"] for bar in bars[25:]), Decimal("0")) / Decimal("5")
+    if prior_25_average <= 0:
+        return None
+
+    vol_peak_ratio = max(bar["quote_volume"] for bar in bars) / baseline
+    volume_acceleration = last_5_average / prior_25_average
+    taker_buy_ratio = taker_buy_total / base_total
+
+    lower_only_count = sum(
+        1 for bar in valid
+        if bar["lower_wick"] > 0 and bar["upper_wick"] == 0
+    )
+    lower_wick_density = Decimal(lower_only_count) / Decimal(len(valid))
+
+    g4h_count = sum(
+        1 for bar in valid
         if (
-            last_processed_open_time_ms is not None
-            and open_time_ms <= int(last_processed_open_time_ms)
-        ):
-            continue
-        closed_by_open_time[open_time_ms] = kline
+            bar["close"] > bar["open"]
+            and bar["body_ratio"] > Decimal("0.75")
+            and bar["quote_volume"] > Decimal("2") * quote_per_minute
+            and bar["upper_wick"] > 0
+        )
+    )
 
-    closed = [closed_by_open_time[key] for key in sorted(closed_by_open_time)]
-    if last_processed_open_time_ms is None:
-        # Do not back-scan and instantly alert on an old TT at first startup.
-        # The newest completed candle is T1; a future closed candle must be T2.
-        closed = closed[-1:]
-    return closed
+    return {
+        "window_start_ms": int(bars[0]["open_time_ms"]),
+        "window_end_ms": int(bars[-1]["close_time_ms"]),
+        "last_close": str(bars[-1]["close"]),
+        "prior_24h_quote_per_minute": str(baseline),
+        "quote_volume_per_minute": str(quote_per_minute),
+        "vol_peak_ratio": str(vol_peak_ratio),
+        "volume_acceleration": str(volume_acceleration),
+        "taker_buy_ratio": str(taker_buy_ratio),
+        "lower_wick_density": str(lower_wick_density),
+        "g4h_count": int(g4h_count),
+        "valid_candles": int(len(valid)),
+        "invalid_candles": int(WINDOW_CANDLES - len(valid)),
+    }
 
-def fmt_price(value):
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
+
+def passes_pump_filter(features):
+    """Pass only when every stated research threshold is satisfied."""
+    if not isinstance(features, dict):
+        return False
+    try:
+        vol_peak = as_decimal(features["vol_peak_ratio"], "vol_peak_ratio")
+        volume_acceleration = as_decimal(features["volume_acceleration"], "volume_acceleration")
+        taker_buy = as_decimal(features["taker_buy_ratio"], "taker_buy_ratio")
+        lower_density = as_decimal(features["lower_wick_density"], "lower_wick_density")
+        quote_per_minute = as_decimal(features["quote_volume_per_minute"], "quote_volume_per_minute")
+        g4h_count = int(features["g4h_count"])
+        valid_count = int(features["valid_candles"])
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return False
+
+    metrics = (vol_peak, volume_acceleration, taker_buy, lower_density, quote_per_minute)
+    if not all(metric.is_finite() for metric in metrics):
+        return False
+    if g4h_count < 0 or valid_count < 0:
+        return False
+
+    return (
+        vol_peak < MAX_VOL_PEAK_RATIO
+        and volume_acceleration < MAX_VOLUME_ACCELERATION
+        and MIN_TAKER_BUY_RATIO < taker_buy < MAX_TAKER_BUY_RATIO
+        and lower_density >= MIN_LOWER_WICK_DENSITY
+        and g4h_count == REQUIRED_G4H_COUNT
+        and quote_per_minute >= MIN_QUOTE_VOLUME_PER_MINUTE
+        and valid_count >= MIN_VALID_CANDLES
+    )
 
 
-def format_alert(symbol, first, second):
-    first_time = datetime.fromtimestamp(
-        first["close_time_ms"] / 1000, tz=timezone.utc
+def in_scan_window(timestamp_ms):
+    local_time = datetime.fromtimestamp(
+        timestamp_ms / 1000, tz=timezone.utc
+    ).astimezone(IST).time()
+    return SCAN_START_IST <= local_time < SCAN_END_IST
+
+
+def ist_date_for(timestamp_ms):
+    return datetime.fromtimestamp(
+        timestamp_ms / 1000, tz=timezone.utc
+    ).astimezone(IST).date().isoformat()
+
+
+def signal_key(symbol, signal_time_ms):
+    return f"{symbol}|{ist_date_for(signal_time_ms)}"
+
+
+def fmt_decimal(value, places=3):
+    return f"{Decimal(str(value)):.{places}f}"
+
+
+def format_alert(symbol, features, signal_time_ms):
+    signal_time = datetime.fromtimestamp(
+        signal_time_ms / 1000, tz=timezone.utc
     ).astimezone(IST)
-    second_time = datetime.fromtimestamp(
-        second["close_time_ms"] / 1000, tz=timezone.utc
+    start_time = datetime.fromtimestamp(
+        features["window_start_ms"] / 1000, tz=timezone.utc
     ).astimezone(IST)
     return (
-        "🟢 <b>15m TT-CANDLE MATCH</b>\n\n"
+        "🟡 <b>PRE-PUMP FILTER MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
-        "<b>Two consecutive T candles detected</b>\n"
-        "<b>Each candle:</b> Body 0% | Upper Wick 0% | Lower Wick 100%\n\n"
-        f"<b>T1:</b> O/H/C {fmt_price(first['open'])} | L {fmt_price(first['low'])}\n"
-        f"<b>T1 closed:</b> {first_time:%Y-%m-%d %H:%M:%S} IST\n"
-        f"<b>T2:</b> O/H/C {fmt_price(second['open'])} | L {fmt_price(second['low'])}\n"
-        f"<b>T2 closed:</b> {second_time:%Y-%m-%d %H:%M:%S} IST"
+        f"<b>Signal time:</b> {signal_time:%Y-%m-%d %H:%M:%S} IST\n"
+        f"<b>30m window:</b> {start_time:%H:%M}–{signal_time:%H:%M} IST\n"
+        "<b>Status:</b> Research candidate only — not a confirmed pump or trade entry\n\n"
+        f"<b>VolPeak / prior 24h avg:</b> {fmt_decimal(features['vol_peak_ratio'])}x (limit &lt;100)\n"
+        f"<b>Volume acceleration:</b> {fmt_decimal(features['volume_acceleration'])}x (limit &lt;0.50)\n"
+        f"<b>Taker-buy ratio:</b> {fmt_decimal(Decimal(features['taker_buy_ratio']) * 100, 2)}% (strictly 50–62%)\n"
+        f"<b>Lower-only wick density:</b> {fmt_decimal(Decimal(features['lower_wick_density']) * 100, 1)}% (limit ≥35%)\n"
+        f"<b>G4H candles:</b> {features['g4h_count']} (must be 0)\n"
+        f"<b>Average quote volume:</b> {fmt_decimal(features['quote_volume_per_minute'], 0)} USDT/min (minimum 1,000)\n"
+        f"<b>Valid candles:</b> {features['valid_candles']}/30 (minimum 12)\n"
+        f"<b>Last close:</b> {html.escape(str(features['last_close']))} USDT"
     )
 
 
 def telegram(message):
-    """Send with bounded retry for Telegram rate limits, transient 5xx and network errors."""
+    """Send Telegram message with bounded retry and no token leakage in logs."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("Telegram is not configured: set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID secrets")
+        log.error("Telegram is not configured: set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -321,7 +518,6 @@ def telegram(message):
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-
     for attempt in range(3):
         try:
             response = _session().post(url, json=payload, timeout=(5, 20))
@@ -334,9 +530,7 @@ def telegram(message):
 
             if response.status_code == 429:
                 parameters = result.get("parameters")
-                if not isinstance(parameters, dict):
-                    parameters = {}
-                retry_after = parameters.get("retry_after", 2)
+                retry_after = parameters.get("retry_after", 2) if isinstance(parameters, dict) else 2
                 try:
                     delay = int(retry_after)
                 except (TypeError, ValueError):
@@ -354,229 +548,115 @@ def telegram(message):
 
             return response.status_code == 200 and result.get("ok") is True
         except requests.RequestException as exc:
-            # Do not log exception text: request URLs contain the Telegram bot token.
             log.warning("Telegram request failed (attempt %s/3): %s", attempt + 1, type(exc).__name__)
             if attempt < 2:
                 time.sleep(2 ** attempt)
-
     return False
 
 
+def initial_state():
+    return {"version": STATE_VERSION, "seen": {}, "pending": {}}
+
+
 def load_state():
-    """Load seen/pending alerts and per-symbol staged T-candle progress."""
+    """Load v2 pre-pump state; deliberately discard old TT pending alerts."""
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"seen": {}, "pending": {}, "tracking": {}}
+        return initial_state()
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            "Scanner state is unreadable or corrupt; refusing to send alerts until it is repaired"
+            "Scanner state is unreadable/corrupt; refusing to send until repaired"
         ) from exc
 
     if not isinstance(data, dict):
-        raise RuntimeError("Scanner state has an invalid format; refusing to send duplicate alerts")
-    if "seen" in data or "pending" in data or "tracking" in data:
-        if not isinstance(data.get("seen"), dict) or not isinstance(data.get("pending"), dict):
-            raise RuntimeError("Scanner state is incomplete or invalid; refusing to send duplicate alerts")
-        tracking = data.get("tracking", {})
-        if not isinstance(tracking, dict):
-            raise RuntimeError("Scanner tracking state is invalid; refusing to skip or duplicate candles")
-        return {
-            "seen": data["seen"],
-            "pending": data["pending"],
-            "tracking": tracking,
-        }
-    # Backward compatibility with the original flat seen-signals JSON file.
-    return {"seen": data, "pending": {}, "tracking": {}}
+        raise RuntimeError("Scanner state has invalid format")
+    if data.get("version") != STATE_VERSION:
+        log.warning(
+            "Migrating old TT scanner state: clearing legacy TT seen/pending data "
+            "so no stale TT alert can be sent by the new pre-pump scanner"
+        )
+        return initial_state()
+    if not isinstance(data.get("seen"), dict) or not isinstance(data.get("pending"), dict):
+        raise RuntimeError("Pre-pump scanner state is incomplete; refusing to send alerts")
+    return {
+        "version": STATE_VERSION,
+        "seen": data["seen"],
+        "pending": data["pending"],
+    }
+
 
 def save_state(state):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     temporary_file = STATE_FILE.with_suffix(".tmp")
     temporary_file.write_text(
-        json.dumps(state, separators=(",", ":"), allow_nan=False), encoding="utf-8"
+        json.dumps(state, separators=(",", ":"), allow_nan=False),
+        encoding="utf-8",
     )
     temporary_file.replace(STATE_FILE)
 
 
-def _serialize_t_candle(candle):
-    return {
-        "open": str(candle["open"]),
-        "high": str(candle["high"]),
-        "low": str(candle["low"]),
-        "close": str(candle["close"]),
-        "open_time_ms": candle["open_time_ms"],
-        "close_time_ms": candle["close_time_ms"],
-    }
-
-
-def serialize_match(symbol, first, second):
+def serialize_candidate(symbol, features):
     return {
         "symbol": symbol,
-        "first": _serialize_t_candle(first),
-        "second": _serialize_t_candle(second),
+        "features": features,
+        "signal_time_ms": int(features["window_end_ms"]),
     }
 
 
-def prune_pending_alerts(pending, server_time_ms):
-    """Discard malformed, stock-linked, or stale queued alerts (keep 30 minutes max)."""
-    cutoff_ms = server_time_ms - PENDING_TTL_MS
+def deserialize_candidate(record):
+    if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
+        raise ValueError("Invalid pending pre-pump candidate")
+    symbol = record["symbol"]
+    if is_excluded_symbol(symbol):
+        raise ValueError("Candidate belongs to an excluded stock/stablecoin pair")
+    features = record.get("features")
+    if not passes_pump_filter(features):
+        raise ValueError("Pending candidate no longer satisfies the pre-pump filter")
+    signal_time_ms = int(record["signal_time_ms"])
+    if signal_time_ms != int(features["window_end_ms"]):
+        raise ValueError("Pending signal timestamp does not match feature window")
+    return symbol, features, signal_time_ms
+
+
+def prune_pending(pending, now_ms):
+    cutoff = now_ms - PENDING_TTL_MS
     kept = {}
     for key, record in pending.items():
-        symbol = key.split("|", 1)[0] if isinstance(key, str) else ""
-        if is_excluded_symbol(symbol) or not isinstance(record, dict):
-            continue
-        second = record.get("second")
-        if not isinstance(second, dict):
-            continue
         try:
-            close_time_ms = int(second["close_time_ms"])
-        except (KeyError, TypeError, ValueError):
+            symbol, features, signal_time_ms = deserialize_candidate(record)
+            if key != signal_key(symbol, signal_time_ms):
+                continue
+            if cutoff <= signal_time_ms < now_ms:
+                kept[key] = record
+        except (KeyError, TypeError, ValueError, InvalidOperation):
             continue
-        if cutoff_ms <= close_time_ms < server_time_ms:
-            kept[key] = record
     return kept
 
 
-def _deserialize_t_candle(record):
-    if not isinstance(record, dict):
-        raise ValueError("Invalid T-candle data")
-    candle = {
-        "open": Decimal(str(record["open"])),
-        "high": Decimal(str(record["high"])),
-        "low": Decimal(str(record["low"])),
-        "close": Decimal(str(record["close"])),
-        "open_time_ms": int(record["open_time_ms"]),
-        "close_time_ms": int(record["close_time_ms"]),
-        "body_pct": Decimal("0"),
-        "upper_wick_pct": Decimal("0"),
-        "lower_wick_pct": Decimal("100"),
-    }
-    prices = (candle["open"], candle["high"], candle["low"], candle["close"])
-    if not all(price.is_finite() for price in prices):
-        raise ValueError("Pending candle contains a non-finite price")
-    if (
-        candle["open_time_ms"] < 0
-        or candle["open_time_ms"] % INTERVAL_MS != 0
-        or candle["close_time_ms"] != candle["open_time_ms"] + INTERVAL_MS - 1
-    ):
-        raise ValueError("Pending candle has invalid 15-minute timestamps")
-    if not (candle["open"] == candle["high"] == candle["close"] and candle["low"] < candle["high"]):
-        raise ValueError("Pending candle does not satisfy the exact T-candle rule")
-    return candle
-
-
-def deserialize_pending(record):
-    if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
-        raise ValueError("Invalid pending TT alert")
-    if is_excluded_symbol(record["symbol"]):
-        raise ValueError("Pending alert belongs to an excluded stock/stablecoin pair")
-    first = _deserialize_t_candle(record["first"])
-    second = _deserialize_t_candle(record["second"])
-    if second["open_time_ms"] - first["open_time_ms"] != INTERVAL_MS:
-        raise ValueError("Pending T candles are not consecutive 15-minute candles")
-    return record["symbol"], first, second
-
-
-def serialize_tracking(last_processed_open_time_ms, first_t):
-    """Persist a symbol's candle cursor and, when present, its first T candle."""
-    return {
-        "last_processed_open_time_ms": last_processed_open_time_ms,
-        "first_t": _serialize_t_candle(first_t) if first_t is not None else None,
-    }
-
-
-def deserialize_tracking(record):
-    if record is None:
-        return None, None
-    if not isinstance(record, dict):
-        raise ValueError("Invalid per-symbol tracking state")
-
-    last_processed = record.get("last_processed_open_time_ms")
-    if (
-        isinstance(last_processed, bool)
-        or not isinstance(last_processed, int)
-        or last_processed < 0
-        or last_processed % INTERVAL_MS != 0
-    ):
-        raise ValueError("Invalid last-processed candle timestamp")
-
-    first_record = record.get("first_t")
-    first_t = _deserialize_t_candle(first_record) if first_record is not None else None
-    if first_t is not None and first_t["open_time_ms"] != last_processed:
-        raise ValueError("Waiting T candle does not match the last-processed candle")
-    return last_processed, first_t
-
-
-def advance_t_sequence(symbol, closed_klines, tracking_record, server_time_ms):
-    """Apply each new closed candle in order: T1 -> next candle T2 -> confirm TT.
-
-    A non-T next candle resets the sequence. After a confirmed pair, both candles
-    are consumed and the scanner waits for a fresh T1 (non-overlapping pairs).
-    """
-    last_processed, first_t = deserialize_tracking(tracking_record)
-    matches = []
-
-    for kline in sorted(closed_klines, key=lambda item: int(item[0])):
-        open_time_ms = int(kline[0])
-        if last_processed is not None and open_time_ms <= last_processed:
-            continue
-
-        # A missing 15-minute candle breaks consecutiveness.
-        if (
-            last_processed is not None
-            and open_time_ms != last_processed + INTERVAL_MS
-        ):
-            first_t = None
-
-        current_t = exact_t_candle(kline)
-        if current_t is None:
-            first_t = None
-        else:
-            if (
-                first_t is not None
-                and current_t["open_time_ms"] - first_t["open_time_ms"] == INTERVAL_MS
-            ):
-                # Do not send an old pair if cron was stopped for too long.
-                if current_t["close_time_ms"] >= server_time_ms - PENDING_TTL_MS:
-                    matches.append((symbol, first_t, current_t))
-                # This T2 may also be T1 of the next adjacent TT pair.
-                # The timestamp-based key still prevents the same pair repeating.
-                first_t = current_t
-            else:
-                first_t = current_t
-
-        last_processed = open_time_ms
-
-    if last_processed is None:
-        return tracking_record, matches
-    return serialize_tracking(last_processed, first_t), matches
-
-
-def scan_symbol(symbol, server_time_ms, server_time_monotonic, tracking_record=None):
-    """Resume this symbol's staged T1/T2 confirmation from persistent state."""
+def scan_symbol(symbol, server_time_ms, server_time_monotonic):
+    """Fetch live 1m OHLCV and pre-window 24h volume baseline for one pair."""
     try:
-        last_processed, _ = deserialize_tracking(tracking_record)
-        closed_klines = fetch_new_closed_klines(
-            symbol,
-            server_time_ms,
-            server_time_monotonic,
-            last_processed,
-        )
-        sequence_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
-        updated_tracking, matches = advance_t_sequence(
-            symbol, closed_klines, tracking_record, sequence_now_ms
-        )
-        return symbol, updated_tracking, matches
+        window = fetch_completed_1m_window(symbol, server_time_ms, server_time_monotonic)
+        if window is None:
+            return None
+        baseline = fetch_prior_24h_quote_baseline(symbol, window[0]["open_time_ms"])
+        if baseline is None:
+            return None
+        features = compute_features(window, baseline)
+        if features is None or not passes_pump_filter(features):
+            return None
+        signal_time_ms = features["window_end_ms"]
+        if not in_scan_window(signal_time_ms):
+            return None
+        return serialize_candidate(symbol, features)
     except (
-        requests.RequestException,
-        KeyError,
-        IndexError,
-        TypeError,
-        ValueError,
-        InvalidOperation,
+        requests.RequestException, KeyError, IndexError, TypeError,
+        ValueError, InvalidOperation,
     ) as exc:
-        log.warning("Could not scan %s: %s", symbol, exc)
-        return "__SCAN_ERROR__", symbol
+        log.warning("Could not analyse %s: %s", symbol, type(exc).__name__)
+        return {"_scan_error": symbol}
+
 
 def set_github_output(name, value):
     output_path = os.environ.get("GITHUB_OUTPUT")
@@ -587,45 +667,53 @@ def set_github_output(name, value):
 
 @contextmanager
 def scanner_lock():
-    """Prevent overlapping system-cron invocations on Linux and GitHub runners."""
+    """Prevent overlapping system-cron or manually dispatched runs on Linux."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("a+") as lock_handle:
+    with LOCK_FILE.open("a+") as handle:
         try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def run_scan():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
 
-    log.info(
-        "Scanner started in staged TT mode: store T1, wait for the next closed 15m candle, "
-        "then confirm only if T2 is also an exact T; stocks excluded"
-    )
-    state = load_state()
     server_time_ms = fetch_server_time_ms()
     server_time_monotonic = time.monotonic()
-    symbols = fetch_universe()
-    log.info("Binance Spot USDT pairs: %s", len(symbols))
+    now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
 
-    updated_tracking = dict(state["tracking"])
-    hits = []
-    scan_errors = 0
+    if not in_scan_window(now_ms):
+        local_now = datetime.fromtimestamp(
+            now_ms / 1000, tz=timezone.utc
+        ).astimezone(IST)
+        log.info(
+            "Outside the research scan window (%s–%s IST); no market scan or alerts",
+            SCAN_START_IST.strftime("%H:%M"),
+            SCAN_END_IST.strftime("%H:%M"),
+        )
+        log.info("Current time: %s IST", local_now.strftime("%Y-%m-%d %H:%M:%S"))
+        return
+
+    state = load_state()
+    symbols = fetch_universe()
+    log.info(
+        "Starting live pre-pump scan: %s pairs; 30 closed 1m candles; prior 24h baseline",
+        len(symbols),
+    )
+
+    candidates = []
+    errors = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                scan_symbol,
-                symbol,
-                server_time_ms,
-                server_time_monotonic,
-                state["tracking"].get(symbol),
+                scan_symbol, symbol, server_time_ms, server_time_monotonic
             ): symbol
             for symbol in symbols
         }
@@ -634,111 +722,88 @@ def run_scan():
             try:
                 result = future.result()
             except Exception as exc:
-                scan_errors += 1
-                log.warning("Unexpected worker failure for %s: %s", symbol, type(exc).__name__)
+                errors += 1
+                log.warning("Unexpected analysis error for %s: %s", symbol, type(exc).__name__)
                 continue
-            if not isinstance(result, tuple) or not result:
-                scan_errors += 1
-                continue
-            if result[0] == "__SCAN_ERROR__":
-                scan_errors += 1
-                continue
-
-            result_symbol, tracking_record, symbol_hits = result
-            if tracking_record is not None:
-                updated_tracking[result_symbol] = tracking_record
-            hits.extend(symbol_hits)
+            if isinstance(result, dict) and result.get("_scan_error"):
+                errors += 1
+            elif result is not None:
+                candidates.append(result)
 
     log.info(
-        "Scan complete: %s eligible crypto pairs checked; %s errors; %s TT sequences confirmed",
-        len(symbols),
-        scan_errors,
-        len(hits),
+        "Market analysis complete: %s pairs; %s data errors; %s filter matches",
+        len(symbols), errors, len(candidates),
     )
 
-    now = time.time()
-    cutoff = now - SEEN_TTL_SEC
-    old_seen = state["seen"]
-    old_pending = state["pending"]
-    old_tracking = state["tracking"]
-
-    state_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
-    state["pending"] = prune_pending_alerts(old_pending, state_now_ms)
+    current_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
+    previous_seen = state["seen"]
+    previous_pending = state["pending"]
+    cutoff_seconds = time.time() - SEEN_TTL_SECONDS
     state["seen"] = {
-        key: timestamp
-        for key, timestamp in old_seen.items()
-        if isinstance(timestamp, (int, float))
-        and not isinstance(timestamp, bool)
-        and math.isfinite(float(timestamp))
-        and timestamp > cutoff
+        key: sent_at
+        for key, sent_at in previous_seen.items()
+        if isinstance(sent_at, (int, float))
+        and not isinstance(sent_at, bool)
+        and math.isfinite(float(sent_at))
+        and float(sent_at) >= cutoff_seconds
         and not is_excluded_symbol(key.split("|", 1)[0])
     }
-    state["tracking"] = {
-        symbol: record
-        for symbol, record in updated_tracking.items()
-        if not is_excluded_symbol(symbol)
-    }
-    state_changed = (
-        state["seen"] != old_seen
-        or state["pending"] != old_pending
-        or state["tracking"] != old_tracking
-    )
+    state["pending"] = prune_pending(previous_pending, current_now_ms)
+    changed = state["seen"] != previous_seen or state["pending"] != previous_pending
 
-    for symbol, first, second in hits:
-        key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
+    for candidate in candidates:
+        key = signal_key(candidate["symbol"], candidate["signal_time_ms"])
         if key not in state["seen"] and key not in state["pending"]:
-            state["pending"][key] = serialize_match(symbol, first, second)
-            state_changed = True
+            state["pending"][key] = candidate
+            changed = True
 
-    # Save T1/cursors and newly confirmed TT alerts before Telegram delivery.
-    if state_changed:
+    # Persist candidates before Telegram delivery so failures can retry.
+    if changed:
         save_state(state)
 
     sent_count = 0
-    failed_alerts = 0
+    failed_count = 0
     for key in sorted(list(state["pending"])):
         if key in state["seen"]:
             del state["pending"][key]
-            state_changed = True
+            changed = True
             continue
         try:
-            symbol, first, second = deserialize_pending(state["pending"][key])
-            expected_key = f"{symbol}|TT|{first['open_time_ms']}|{second['open_time_ms']}"
-            if key != expected_key:
-                raise ValueError("Pending alert key does not match its candle data")
+            symbol, features, signal_time_ms = deserialize_candidate(state["pending"][key])
+            if key != signal_key(symbol, signal_time_ms):
+                raise ValueError("Pending candidate key mismatch")
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            log.error("Removing invalid pending alert %s: %s", key, exc)
+            log.error("Dropping invalid pending candidate %s: %s", key, type(exc).__name__)
             del state["pending"][key]
-            state_changed = True
+            changed = True
             continue
 
-        if telegram(format_alert(symbol, first, second)):
+        if telegram(format_alert(symbol, features, signal_time_ms)):
             state["seen"][key] = time.time()
             del state["pending"][key]
             sent_count += 1
-            state_changed = True
+            changed = True
             save_state(state)
-            log.info("Telegram TT confirmation sent: %s", symbol)
+            log.info("Pre-pump candidate alert sent: %s", symbol)
         else:
-            failed_alerts += 1
-            log.error("Telegram alert failed and will retry on next cron run: %s", symbol)
+            failed_count += 1
+            log.error("Telegram send failed; candidate will retry until stale: %s", symbol)
 
-    if state_changed:
+    if changed:
         save_state(state)
-    set_github_output("cache_changed", "true" if state_changed else "false")
+    set_github_output("cache_changed", "true" if changed else "false")
     log.info(
-        "Finished: %s TT confirmations sent; %s alert failures; %s pending",
-        sent_count,
-        failed_alerts,
-        len(state["pending"]),
+        "Finished: %s candidate alerts sent; %s failures; %s pending",
+        sent_count, failed_count, len(state["pending"]),
     )
+
 
 def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID environment variable")
     with scanner_lock() as acquired:
         if not acquired:
-            log.warning("Another scanner instance is active; this invocation will exit")
+            log.warning("Another scanner process is active; exiting")
             return
         run_scan()
 
