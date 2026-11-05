@@ -198,15 +198,13 @@ def fetch_universe():
             continue
         if item.get("quoteAsset") != "USDT" or item.get("status") != "TRADING":
             continue
-        if item.get("isSpotTradingAllowed") is False:
+        if item.get("isSpotTradingAllowed") is not True:
             continue
 
         symbol = item.get("symbol")
         base_asset = item.get("baseAsset")
-        if not _valid_usdt_symbol(symbol):
+        if not _valid_usdt_symbol(symbol) or not isinstance(base_asset, str):
             continue
-        if not isinstance(base_asset, str):
-            base_asset = base_asset_from_symbol(symbol)
         # Exchange metadata must agree with the symbol suffix; fail closed on malformed rows.
         if (
             not base_asset.isascii()
@@ -279,6 +277,8 @@ def parse_kline(row, interval_ms):
         raise ValueError("Negative volume")
     if (base_volume == 0) != (quote_volume == 0):
         raise ValueError("Base and quote volumes disagree on zero trades")
+    if base_volume == 0 and high_price != low_price:
+        raise ValueError("Zero-volume candle has a non-zero price range")
     if taker_buy_base > base_volume:
         raise ValueError("Taker-buy base volume exceeds total base volume")
 
