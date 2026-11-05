@@ -38,6 +38,8 @@ MAX_WORKERS = 12
 REQUESTS_PER_SECOND = 8
 PENDING_TTL_MS = 30 * 60 * 1000
 SEEN_TTL_SECONDS = 7 * 24 * 60 * 60
+SEEN_FUTURE_SKEW_SECONDS = 5 * 60
+MAX_TIMESTAMP_MS = 253402300799999  # Last millisecond representable by datetime.
 STATE_VERSION = 2
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -150,8 +152,19 @@ def effective_server_time_ms(server_time_ms, server_time_monotonic):
     return server_time_ms + elapsed_ms
 
 
+def _valid_usdt_symbol(symbol):
+    return (
+        isinstance(symbol, str)
+        and symbol.isascii()
+        and symbol == symbol.upper()
+        and symbol.endswith("USDT")
+        and len(symbol) > 4
+        and symbol[:-4].isalnum()
+    )
+
+
 def base_asset_from_symbol(symbol):
-    return symbol[:-4] if isinstance(symbol, str) and symbol.endswith("USDT") else symbol
+    return symbol[:-4] if _valid_usdt_symbol(symbol) else symbol
 
 
 def is_excluded_symbol(symbol):
@@ -179,12 +192,16 @@ def fetch_universe():
 
         symbol = item.get("symbol")
         base_asset = item.get("baseAsset")
-        if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+        if not _valid_usdt_symbol(symbol):
             continue
         if not isinstance(base_asset, str):
             base_asset = base_asset_from_symbol(symbol)
         # Exchange metadata must agree with the symbol suffix; fail closed on malformed rows.
-        if base_asset != base_asset_from_symbol(symbol) or not base_asset.isascii():
+        if (
+            not base_asset.isascii()
+            or not base_asset.isalnum()
+            or base_asset != base_asset_from_symbol(symbol)
+        ):
             continue
 
         if base_asset in STOCK_LINKED_ASSETS:
@@ -348,6 +365,9 @@ def fetch_prior_24h_quote_baseline(symbol, window_start_ms):
         quote_volume = as_decimal(row[7], "1h quote volume")
         if quote_volume < 0:
             raise ValueError("Negative 1h quote volume")
+        if open_ms in completed:
+            log.warning("Duplicate 1h candle timestamp for %s; skipping incomplete baseline", symbol)
+            return None
         completed[open_ms] = quote_volume
 
     hours = sorted(completed.items())[-BASELINE_HOURS:]
@@ -445,10 +465,17 @@ def passes_pump_filter(features):
         quote_per_minute = as_decimal(features["quote_volume_per_minute"], "quote_volume_per_minute")
         g4h_count = int(features["g4h_count"])
         valid_count = int(features["valid_candles"])
-    except (KeyError, TypeError, ValueError, InvalidOperation):
+        last_close = as_decimal(features["last_close"], "last_close")
+        prior_baseline = as_decimal(
+            features["prior_24h_quote_per_minute"], "prior_24h_quote_per_minute"
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
         return False
 
-    metrics = (vol_peak, volume_acceleration, taker_buy, lower_density, quote_per_minute)
+    metrics = (
+        vol_peak, volume_acceleration, taker_buy, lower_density,
+        quote_per_minute, last_close, prior_baseline,
+    )
     if not all(metric.is_finite() for metric in metrics):
         return False
     if g4h_count < 0 or valid_count < 0:
@@ -472,7 +499,14 @@ def passes_pump_filter(features):
     except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
         return False
 
-    if end_ms - start_ms != WINDOW_CANDLES * ONE_MINUTE_MS - 1:
+    if (
+        start_ms < 0
+        or end_ms > MAX_TIMESTAMP_MS
+        or start_ms % ONE_MINUTE_MS != 0
+        or end_ms - start_ms != WINDOW_CANDLES * ONE_MINUTE_MS - 1
+        or last_close <= 0
+        or prior_baseline <= 0
+    ):
         return False
     if not (MIN_VALID_CANDLES <= valid_count <= WINDOW_CANDLES):
         return False
@@ -512,6 +546,36 @@ def ist_date_for(timestamp_ms):
 
 def signal_key(symbol, signal_time_ms):
     return f"{symbol}|{ist_date_for(signal_time_ms)}"
+
+
+def prune_seen(seen, now_seconds=None):
+    """Discard malformed, stale, or implausibly future-dated deduplication entries."""
+    if not isinstance(seen, dict):
+        return {}
+    now = Decimal(str(time.time() if now_seconds is None else now_seconds))
+    cutoff = now - Decimal(SEEN_TTL_SECONDS)
+    future_limit = now + Decimal(SEEN_FUTURE_SKEW_SECONDS)
+    kept = {}
+    for key, sent_at in seen.items():
+        if not isinstance(key, str) or not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            continue
+        symbol, separator, day = key.partition("|")
+        if (
+            not separator
+            or "|" in day
+            or not _valid_usdt_symbol(symbol)
+            or is_excluded_symbol(symbol)
+        ):
+            continue
+        try:
+            if datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day:
+                continue
+            timestamp = Decimal(str(sent_at))
+        except (ValueError, TypeError, InvalidOperation):
+            continue
+        if timestamp.is_finite() and cutoff <= timestamp <= future_limit:
+            kept[key] = sent_at
+    return kept
 
 
 def fmt_decimal(value, places=3):
@@ -645,13 +709,7 @@ def deserialize_candidate(record):
     if not isinstance(record, dict) or not isinstance(record.get("symbol"), str):
         raise ValueError("Invalid pending pre-pump candidate")
     symbol = record["symbol"]
-    if (
-        not symbol.isascii()
-        or symbol != symbol.upper()
-        or not symbol.endswith("USDT")
-        or len(symbol) <= 4
-        or not symbol[:-4].isalnum()
-    ):
+    if not _valid_usdt_symbol(symbol):
         raise ValueError("Pending candidate has an invalid Binance symbol")
     if is_excluded_symbol(symbol):
         raise ValueError("Candidate belongs to an excluded stock/stablecoin pair")
@@ -659,11 +717,23 @@ def deserialize_candidate(record):
     if not passes_pump_filter(features):
         raise ValueError("Pending candidate no longer satisfies the pre-pump filter")
     raw_signal_time = record["signal_time_ms"]
-    signal_time_ms = int(raw_signal_time)
-    if isinstance(raw_signal_time, bool) or Decimal(str(raw_signal_time)) != Decimal(signal_time_ms):
-        raise ValueError("Pending signal timestamp is not an integer")
+    try:
+        signal_time_ms = int(raw_signal_time)
+        exact_signal_time = Decimal(str(raw_signal_time))
+    except (TypeError, ValueError, InvalidOperation, OverflowError) as exc:
+        raise ValueError("Pending signal timestamp is invalid") from exc
+    if (
+        isinstance(raw_signal_time, bool)
+        or not exact_signal_time.is_finite()
+        or exact_signal_time != Decimal(signal_time_ms)
+        or signal_time_ms < 0
+        or signal_time_ms > MAX_TIMESTAMP_MS
+    ):
+        raise ValueError("Pending signal timestamp is not a supported integer")
     if signal_time_ms != int(features["window_end_ms"]):
         raise ValueError("Pending signal timestamp does not match feature window")
+    if not in_scan_window(signal_time_ms):
+        raise ValueError("Pending signal timestamp is outside the scan window")
     return symbol, features, signal_time_ms
 
 
@@ -677,7 +747,7 @@ def prune_pending(pending, now_ms):
                 continue
             if cutoff <= signal_time_ms < now_ms:
                 kept[key] = record
-        except (KeyError, TypeError, ValueError, InvalidOperation):
+        except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
             continue
     return kept
 
@@ -700,7 +770,7 @@ def scan_symbol(symbol, server_time_ms, server_time_monotonic):
         return serialize_candidate(symbol, features)
     except (
         requests.RequestException, KeyError, IndexError, TypeError,
-        ValueError, InvalidOperation,
+        ValueError, InvalidOperation, OverflowError,
     ) as exc:
         log.warning("Could not analyse %s: %s", symbol, type(exc).__name__)
         return {"_scan_error": symbol}
@@ -786,16 +856,7 @@ def run_scan():
     current_now_ms = effective_server_time_ms(server_time_ms, server_time_monotonic)
     previous_seen = state["seen"]
     previous_pending = state["pending"]
-    cutoff_seconds = time.time() - SEEN_TTL_SECONDS
-    state["seen"] = {
-        key: sent_at
-        for key, sent_at in previous_seen.items()
-        if isinstance(sent_at, (int, float))
-        and not isinstance(sent_at, bool)
-        and math.isfinite(float(sent_at))
-        and float(sent_at) >= cutoff_seconds
-        and not is_excluded_symbol(key.split("|", 1)[0])
-    }
+    state["seen"] = prune_seen(previous_seen)
     state["pending"] = prune_pending(previous_pending, current_now_ms)
     changed = state["seen"] != previous_seen or state["pending"] != previous_pending
 
