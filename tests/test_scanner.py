@@ -327,6 +327,17 @@ class BaselineAndWindowFetchTests(unittest.TestCase):
 
 
 class ScheduleAndStateTests(unittest.TestCase):
+    def test_millisecond_datetime_conversion_is_exact(self):
+        stamp = int(datetime(2026, 11, 5, 0, 0, tzinfo=timezone.utc).timestamp()) * 1000 - 1
+        self.assertEqual(
+            scanner.datetime_from_ms(stamp),
+            datetime(2026, 11, 4, 23, 59, 59, 999000, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            scanner.datetime_from_ms(scanner.MAX_TIMESTAMP_MS),
+            datetime(9999, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc),
+        )
+
     def test_research_window_is_0530_to_1800_ist(self):
         before_start = int(datetime(2026, 11, 4, 23, 59, tzinfo=timezone.utc).timestamp() * 1000)
         start = int(datetime(2026, 11, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
