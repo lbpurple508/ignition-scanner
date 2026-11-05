@@ -47,7 +47,7 @@ LOCK_FILE = STATE_DIR / "scanner.lock"
 
 IST = ZoneInfo("Asia/Kolkata")
 SCAN_START_IST = clock_time(5, 30)
-SCAN_END_IST = clock_time(8, 30)
+SCAN_END_IST = clock_time(18, 0)
 
 # Thresholds from the user's Nov 5, 2026 research handoff.
 MAX_VOL_PEAK_RATIO = Decimal("100")
