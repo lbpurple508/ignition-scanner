@@ -58,24 +58,26 @@ jobs:
               raise SystemExit(1)
           PY
 
-      - run: pip install requests
+      - name: install dependencies
+        id: install_dependencies
+        run: pip install requests
 
       - name: scan
-        if: always() && steps.verify_cache.outcome == 'success'
+        if: always() && steps.verify_cache.outcome == 'success' && steps.install_dependencies.outcome == 'success'
         run: python3 scanner.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: watch
-        if: always() && steps.verify_cache.outcome == 'success'
+        if: always() && steps.verify_cache.outcome == 'success' && steps.install_dependencies.outcome == 'success'
         run: python3 entry_watcher.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: save state
-        if: always() && steps.verify_cache.outcome == 'success'
+        if: always() && steps.verify_cache.outcome == 'success' && steps.install_dependencies.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: .scanner_state/

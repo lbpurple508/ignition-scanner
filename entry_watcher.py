@@ -5,7 +5,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -132,11 +132,15 @@ def candle_fields(row):
     if not isinstance(row, (list, tuple)) or len(row) < 7:
         raise ValueError("malformed candle")
     close_time = as_decimal(row[6])
-    if close_time != close_time.to_integral_value() or close_time <= 0:
+    if (
+        close_time != close_time.to_integral_value()
+        or close_time <= 0
+        or int(close_time) % 60_000 != 59_999
+    ):
         raise ValueError("invalid candle time")
     close = as_decimal(row[4])
     volume = as_decimal(row[5])
-    if volume < 0:
+    if close <= 0 or volume < 0:
         raise ValueError("invalid candle values")
     return int(close_time), close, volume
 
@@ -145,16 +149,23 @@ def evaluate(rows, now_ms):
     if not isinstance(rows, list) or len(rows) < 35:
         return None
     try:
-        prior = [candle_fields(row) for row in rows[-32:-2]]
-        latest_time, latest_close, latest_volume = candle_fields(rows[-2])
-        _, reference_close, _ = candle_fields(rows[-7])
+        recent = [candle_fields(row) for row in rows[-32:]]
+        for previous, current in zip(recent, recent[1:]):
+            if current[0] - previous[0] != 60_000:
+                return None
+
+        prior = recent[:30]
+        latest_time, latest_close, latest_volume = recent[-2]
+        _, reference_close, _ = recent[-7]
         if now_ms < latest_time or now_ms - latest_time > STALE_MS:
             return None
         if reference_close <= 0 or latest_close <= 0 or latest_volume <= 0:
             return None
+
         avg_volume = sum((item[2] for item in prior), Decimal("0")) / Decimal(30)
         if not avg_volume.is_finite() or avg_volume <= 0:
             return None
+
         ret_5m = (latest_close - reference_close) / reference_close * Decimal(100)
         vol_ratio = latest_volume / avg_volume
         if not ret_5m.is_finite() or not vol_ratio.is_finite():
@@ -167,7 +178,7 @@ def evaluate(rows, now_ms):
                 "R1": ret_5m,
                 "V1": vol_ratio,
             }
-    except (IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
+    except (IndexError, TypeError, ValueError, DecimalException, OverflowError):
         return None
     return None
 
@@ -231,8 +242,13 @@ def entry_message(symbol, values):
 def process(now_seconds=None):
     seen = load_seen()
     state = load_entry_state()
-    current = as_decimal(time.time() if now_seconds is None else now_seconds)
-    today = datetime.fromtimestamp(float(current), tz=timezone.utc).astimezone(IST).date()
+    fixed_now = None if now_seconds is None else as_decimal(now_seconds)
+
+    def current_time():
+        return as_decimal(time.time()) if fixed_now is None else fixed_now
+
+    initial_now = current_time()
+    today = datetime.fromtimestamp(float(initial_now), tz=timezone.utc).astimezone(IST).date()
     changed = prune_entry_state(state, seen, today)
     entered = 0
     expired = 0
@@ -245,7 +261,11 @@ def process(now_seconds=None):
             alert_time = as_decimal(raw_timestamp)
             if alert_time <= 0:
                 continue
-            age = current - alert_time
+
+            now = current_time()
+            age = now - alert_time
+            if age < 0:
+                continue
             if age >= MAX_AGE_SECONDS:
                 message = expired_message(symbol, alert_time)
                 if send_telegram(message):
@@ -258,7 +278,20 @@ def process(now_seconds=None):
             rows = fetch_candles(symbol)
             if rows is None:
                 continue
-            values = evaluate(rows, int(current * Decimal(1000)))
+
+            check_now = current_time()
+            age = check_now - alert_time
+            if age < 0:
+                continue
+            if age >= MAX_AGE_SECONDS:
+                if send_telegram(expired_message(symbol, alert_time)):
+                    state[key] = "expired"
+                    expired += 1
+                    changed = True
+                    save_entry_state(state)
+                continue
+
+            values = evaluate(rows, int(check_now * Decimal(1000)))
             if values is not None and send_telegram(entry_message(symbol, values)):
                 state[key] = "entered"
                 entered += 1
