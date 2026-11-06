@@ -267,8 +267,7 @@ def process(now_seconds=None):
             if age < 0:
                 continue
             if age >= MAX_AGE_SECONDS:
-                message = expired_message(symbol, alert_time)
-                if send_telegram(message):
+                if send_telegram(expired_message(symbol, alert_time)):
                     state[key] = "expired"
                     expired += 1
                     changed = True
