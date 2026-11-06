@@ -9,6 +9,7 @@ permissions:
 concurrency:
   group: sync
   cancel-in-progress: false
+  queue: max
 
 jobs:
   run:
