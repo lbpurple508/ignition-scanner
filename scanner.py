@@ -50,7 +50,6 @@ IST = ZoneInfo("Asia/Kolkata")
 SCAN_START_IST = clock_time(5, 30)
 SCAN_END_IST = clock_time(18, 0)
 
-# Thresholds from the user's Nov 5, 2026 research handoff.
 MAX_VOL_PEAK_RATIO = Decimal("100")
 MAX_VOLUME_ACCELERATION = Decimal("0.50")
 MIN_TAKER_BUY_RATIO = Decimal("0.50")  # strict lower bound
@@ -616,7 +615,7 @@ def format_alert(symbol, features, signal_time_ms):
     start_time = datetime_from_ms(window_start_ms).astimezone(IST)
     end_time = datetime_from_ms(window_end_ms + 1).astimezone(IST)
     return (
-        "🟡 <b>PRE-PUMP FILTER MATCH</b>\n\n"
+        "🟡 <b>MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
         f"<b>Signal time:</b> {signal_time:%Y-%m-%d %H:%M:%S} IST\n"
         f"<b>30m window:</b> {start_time:%H:%M}–{end_time:%H:%M} IST\n"
@@ -891,7 +890,6 @@ def run_scan():
             state["pending"][key] = candidate
             changed = True
 
-    # Persist candidates before Telegram delivery so failures can retry.
     if changed:
         save_state(state)
 

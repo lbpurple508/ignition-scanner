@@ -1,0 +1,81 @@
+name: sync
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: restore state
+        id: restore_state
+        uses: actions/cache/restore@v4
+        with:
+          path: .scanner_state/
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            scanner-state-
+
+      - name: verify-cache
+        id: verify_cache
+        run: |
+          if [ ! -s .scanner_state/seen_signals.json ]; then
+            echo "::error::Required state cache is missing; refusing to run."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          try:
+              data = json.loads(Path(".scanner_state/seen_signals.json").read_text(encoding="utf-8"))
+              valid = (
+                  isinstance(data, dict)
+                  and data.get("version") == 2
+                  and isinstance(data.get("seen"), dict)
+                  and isinstance(data.get("pending"), dict)
+              )
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              valid = False
+
+          if not valid:
+              print("::error::Required state cache is invalid; refusing to run.")
+              raise SystemExit(1)
+          PY
+
+      - run: pip install requests
+
+      - name: scan
+        if: always() && steps.verify_cache.outcome == 'success'
+        run: python3 scanner.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: watch
+        if: always() && steps.verify_cache.outcome == 'success'
+        run: python3 entry_watcher.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: save state
+        if: always() && steps.verify_cache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .scanner_state/
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}
