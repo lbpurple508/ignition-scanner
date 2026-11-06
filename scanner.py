@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Live Binance Spot USDT pre-pump candidate scanner based on the supplied Nov 5 study.
-
-This is a research filter, not a trading system. It emits candidates only.
-"""
+"""Data collection tool."""
 
 import fcntl
 import html
@@ -618,8 +615,7 @@ def format_alert(symbol, features, signal_time_ms):
         "🟡 <b>MATCH</b>\n\n"
         f"<b>Pair:</b> {html.escape(symbol)}\n"
         f"<b>Signal time:</b> {signal_time:%Y-%m-%d %H:%M:%S} IST\n"
-        f"<b>30m window:</b> {start_time:%H:%M}–{end_time:%H:%M} IST\n"
-        "<b>Status:</b> Research candidate only — not a confirmed pump or trade entry\n\n"
+        f"<b>30m window:</b> {start_time:%H:%M}–{end_time:%H:%M} IST\n\n"
         f"<b>VolPeak / prior 24h avg:</b> {fmt_decimal(features['vol_peak_ratio'])}x (limit &lt;100)\n"
         f"<b>Volume acceleration:</b> {fmt_decimal(features['volume_acceleration'])}x (limit &lt;0.50)\n"
         f"<b>Taker-buy ratio:</b> {fmt_decimal(Decimal(features['taker_buy_ratio']) * 100, 2)}% (strictly 50–62%)\n"

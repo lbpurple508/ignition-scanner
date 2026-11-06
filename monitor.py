@@ -269,9 +269,11 @@ def process(now_seconds=None):
             if age >= MAX_AGE_SECONDS:
                 if send_telegram(expired_message(symbol, alert_time)):
                     state[key] = "expired"
-                    expired += 1
+                    if not save_entry_state(state):
+                        state.pop(key, None)
+                    else:
+                        expired += 1
                     changed = True
-                    save_entry_state(state)
                 continue
 
             rows = fetch_candles(symbol)
@@ -285,17 +287,21 @@ def process(now_seconds=None):
             if age >= MAX_AGE_SECONDS:
                 if send_telegram(expired_message(symbol, alert_time)):
                     state[key] = "expired"
-                    expired += 1
+                    if not save_entry_state(state):
+                        state.pop(key, None)
+                    else:
+                        expired += 1
                     changed = True
-                    save_entry_state(state)
                 continue
 
             values = evaluate(rows, int(check_now * Decimal(1000)))
             if values is not None and send_telegram(entry_message(symbol, values)):
                 state[key] = "entered"
-                entered += 1
+                if not save_entry_state(state):
+                    state.pop(key, None)
+                else:
+                    entered += 1
                 changed = True
-                save_entry_state(state)
         except Exception:
             continue
 
@@ -305,9 +311,12 @@ def process(now_seconds=None):
 
 
 def main():
+    import traceback
     try:
         entered, expired = process()
-    except Exception:
+    except Exception as e:
+        print(f"watcher_error: {type(e).__name__}: {e}")
+        traceback.print_exc()
         entered, expired = 0, 0
     print(f"entered={entered} expired={expired}")
 
