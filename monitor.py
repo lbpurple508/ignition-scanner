@@ -19,6 +19,7 @@ BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 IST = ZoneInfo("Asia/Kolkata")
 MAX_AGE_SECONDS = Decimal(12 * 60 * 60)
+MAX_TOKEN_PRICE_USDT = Decimal("3")  # Maximum live entry price allowed
 STALE_MS = 5 * 60 * 1000
 VALID_SYMBOL = re.compile(r"^[A-Z0-9]+USDT$")
 
@@ -170,7 +171,11 @@ def evaluate(rows, now_ms):
         vol_ratio = latest_volume / avg_volume
         if not ret_5m.is_finite() or not vol_ratio.is_finite():
             return None
-        if ret_5m > Decimal("1.5") and vol_ratio > Decimal("3.0"):
+        if (
+            ret_5m > Decimal("1.5")
+            and vol_ratio > Decimal("3.0")
+            and latest_close <= MAX_TOKEN_PRICE_USDT
+        ):
             return {
                 "P1": latest_close,
                 "P2": latest_close * Decimal("0.95"),
