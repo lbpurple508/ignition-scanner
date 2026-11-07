@@ -54,6 +54,7 @@ MAX_TAKER_BUY_RATIO = Decimal("0.62")  # strict upper bound
 MIN_LOWER_WICK_DENSITY = Decimal("0.35")
 REQUIRED_G4H_COUNT = 0
 MIN_QUOTE_VOLUME_PER_MINUTE = Decimal("1000")
+MAX_TOKEN_PRICE_USDT = Decimal("3")  # Maximum latest close allowed for an alert
 
 # Tokenized equities / securities listed on Binance Spot.
 # Explicit list: do not blanket-exclude every ticker ending in B (e.g. BNB).
@@ -545,6 +546,7 @@ def passes_pump_filter(features):
         and lower_density >= MIN_LOWER_WICK_DENSITY
         and g4h_count == REQUIRED_G4H_COUNT
         and quote_per_minute >= MIN_QUOTE_VOLUME_PER_MINUTE
+        and last_close <= MAX_TOKEN_PRICE_USDT
     )
 
 
