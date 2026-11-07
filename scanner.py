@@ -76,7 +76,7 @@ STOCK_LINKED_ASSETS = frozenset({
 # it remains the quote asset for normal crypto pairs.
 STABLECOIN_ASSETS = frozenset({
     "AEUR", "AUSD", "BIDR", "BFUSD", "BUSD", "CRVUSD", "DAI", "EURI",
-    "EURC", "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT",
+    "EUR", "EURC", "EURS", "EURT", "FDUSD", "FRAX", "GHO", "GUSD", "IDRT",
     "KGST", "LUSD", "MUSD", "OUSD", "PYUSD", "RLUSD", "SUSD", "TRYB",
     "TUSD", "U", "USDB", "USDD", "USDE", "USDF", "USD0", "USD1",
     "USDG", "USDP", "USDQ", "USDS", "USDTB", "USDX", "USDY", "USDC",
