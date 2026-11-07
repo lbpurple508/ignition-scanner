@@ -42,6 +42,8 @@ def parse_key(key):
     symbol, day_text = key.split("|", 1)
     if not VALID_SYMBOL.fullmatch(symbol):
         raise ValueError("invalid symbol")
+    if symbol == "EURUSDT":
+        raise ValueError("excluded EUR fiat pair")
     day = datetime.strptime(day_text, "%Y-%m-%d").date()
     if day.isoformat() != day_text:
         raise ValueError("invalid date")
